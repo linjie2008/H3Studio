@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv-agent/
+.venv-translation/
+data/
+logs/
+static/index.html.bak
+static/index.html.bak-20261016
+comfyui_backup/
