@@ -1,0 +1,52 @@
+/* Vue 应用补充样式：legacy.css 提供绝大部分旧设计类，这里只补新结构需要的少量规则。 */
+html, body {
+  height: 100%;
+}
+#app {
+  height: 100%;
+}
+.app-rail button {
+  cursor: pointer;
+}
+.app-rail button:disabled,
+.top-btn:disabled,
+button:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}
+/* 设置页滚动容器：旧 UI 用 .settings-workspace + .settings-page 组合 */
+.settings-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 24px 28px;
+  background: #f5f5f7;
+}
+.settings-scroll .grid3 {
+  max-width: 1100px;
+}
+.field select,
+.field input {
+  width: 100%;
+}
+/* 项目卡片网格（复用旧 project-card 类） */
+.project-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 16px;
+}
+/* Skill 预览弹窗 */
+.skill-preview-body section {
+  margin-bottom: 14px;
+}
+.skill-preview-body pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #f6f7f9;
+  border: 1px solid #e3e6ea;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  max-height: 320px;
+  overflow: auto;
+}

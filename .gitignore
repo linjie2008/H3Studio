@@ -7,3 +7,5 @@ logs/
 static/index.html.bak
 static/index.html.bak-20261016
 comfyui_backup/
+web/node_modules/
+web/dist/

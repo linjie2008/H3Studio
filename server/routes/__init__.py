@@ -18,6 +18,7 @@ from . import media
 from . import runs
 from . import jobs
 from . import packs
+from . import webapp
 
 ALL = [
     system.ROUTES,
@@ -32,6 +33,7 @@ ALL = [
     runs.ROUTES,
     jobs.ROUTES,
     packs.ROUTES,
+    webapp.ROUTES,
 ]
 
 ORDER = [
@@ -107,6 +109,8 @@ ORDER = [
     ('DELETE', 'delete_api_assets'),
     ('DELETE', 'delete_api_projects'),
     ('PUT', 'put_api_projects'),
+    ('GET', 'get_app_index'),
+    ('GET', 'get_app_asset'),
 ]
 
 
