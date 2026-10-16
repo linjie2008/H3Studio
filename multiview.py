@@ -29,8 +29,17 @@ GREEN_BG_NODE = "easy imageRemBg"
 XB_I2I_WORKFLOW = (Path(os.environ.get("COMFYUI_DIR", "/home/administrator/ComfyUI")) /
                    "user/default/workflows/Qwen-Image/2.1/图片编辑/"
                    "Qwen-Image-2.1_69-图片编辑进阶工作流-本机适配.json")
-SIX_VIEW_WORKFLOW = (Path(os.environ.get("COMFYUI_DIR", "/home/administrator/ComfyUI")) /
-                     "user/default/workflows/qwen-image2.1_人物定装照四视图_六视图.json")
+_SIX_VIEW_WORKFLOW_CANDIDATES = tuple(
+    Path(os.environ.get("COMFYUI_DIR", "/home/administrator/ComfyUI")) / relative
+    for relative in (
+        # Current location inside the Qwen-Image category folder.
+        "user/default/workflows/Qwen-Image/2.1/"
+        "qwen-image2.1_人物定装照四视图_六视图.json",
+        # Legacy location at the workflows root.
+        "user/default/workflows/qwen-image2.1_人物定装照四视图_六视图.json",
+    ))
+SIX_VIEW_WORKFLOW = next((path for path in _SIX_VIEW_WORKFLOW_CANDIDATES if path.is_file()),
+                         _SIX_VIEW_WORKFLOW_CANDIDATES[0])
 
 
 def _xb_i2i_workflow_defaults() -> dict:

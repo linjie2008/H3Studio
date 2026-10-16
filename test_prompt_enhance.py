@@ -81,7 +81,8 @@ class PromptEnhancementTests(unittest.TestCase):
         self.assertIn('short black hair', request)
         self.assertIn('metadata only', request)
         system = captured['messages'][0]['content']
-        self.assertIn("Follow the selected H3 writing Skill", system)
+        self.assertIn("Apply the selected Skill's timing and directing rules", system)
+        self.assertIn("Selected H3 writing Skill", system)
         self.assertIn("Target duration: 5 seconds", system)
         self.assertNotIn("Do not replace or redesign their background", system)
         self.assertNotIn("never force a person", system)

@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import multiview
@@ -37,10 +40,34 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertEqual((character["multiview_engine"], character["multiview_layout"]),
                          ("qwen_sheet", "six"))
 
+    @staticmethod
+    def _six_view_workflow_file(tmpdir: str) -> Path:
+        """Write a minimal character-sheet workflow the builder can parse."""
+        def node(node_id, widgets):
+            return {"id": node_id, "widgets_values": widgets}
+        workflow = {"nodes": [
+            node(21, ["一张2行×3列的人物六视图定装照（character sheet），共6格"]),
+            node(50, ["qwen_image_2.1_bf16.safetensors", "default"]),
+            node(52, ["clip_int8.safetensors", "qwen_image", "default"]),
+            node(54, ["qwen_image_2.1_vae_bf16.safetensors"]),
+            node(40, [1, "fixed", 40, 1, "euler", "simple", 1]),
+            node(30, ["", "", 1280]),
+            node(10, ["original", 1, 1, "fill", "lanczos", "8", "longest",
+                      2048, "#000000"]),
+        ]}
+        path = Path(tmpdir) / "six_view_workflow.json"
+        path.write_text(json.dumps(workflow, ensure_ascii=False), encoding="utf-8")
+        return path
+
     def test_six_view_graph_uses_saved_character_sheet_workflow(self):
-        with patch.object(multiview, "api", return_value={
-                "LayerUtility: ImageScaleByAspectRatio V2": {}, "QwenImage21Cache": {},
-                "TextEncodeQwenImage21": {}}):
+        # The character-sheet workflow lives in the ComfyUI user directory and
+        # may be edited at any time; parse a fixed fixture instead.
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+                multiview, "SIX_VIEW_WORKFLOW",
+                self._six_view_workflow_file(tmpdir)), patch.object(
+                multiview, "api", return_value={
+                    "LayerUtility: ImageScaleByAspectRatio V2": {}, "QwenImage21Cache": {},
+                    "TextEncodeQwenImage21": {}}):
             graph = multiview.build_graph("portrait.png", "fast", "six", "灰色军装",
                                           "six", "qwen_sheet")
         self.assertEqual(graph["8"]["inputs"], {"width": 1536, "height": 2048,
@@ -215,8 +242,12 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertEqual(graph["7"]["inputs"]["images"], ["202", 0])
 
     def test_xb_qwen_five_view_i2i_keeps_workflow_69_preset_text(self):
+        # The local workflow 69 file is user-editable, so read its default
+        # preset text from a fixed stub instead of the machine's JSON.
         with patch.object(multiview, "_require_xb_qwen"), patch.object(
-                multiview, "_model_config", return_value=("model", "clip", "vae")):
+                multiview, "_model_config", return_value=("model", "clip", "vae")), \
+             patch.object(multiview, "_xb_i2i_workflow_defaults",
+                          return_value={"preset_text": "生成五宫格排列的角色概念设计图"}):
             graph = multiview.build_graph(
                 "portrait.png", "fast", "xb5", "角色", "five", "xb_qwen", {})
         self.assertEqual(graph["100"]["inputs"]["preset_mode"], "人物五视图")
