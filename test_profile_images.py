@@ -10,6 +10,16 @@ import store
 
 
 class ProfileImageGraphTests(unittest.TestCase):
+    def test_interrupted_comfy_generation_reports_clear_error(self):
+        history = {"status": {"status_str": "error", "messages": [
+            ["execution_start", {"prompt_id": "p"}],
+            ["execution_interrupted", {"node_id": "9", "node_type": "KSampler"}],
+        ]}}
+        with patch.object(multiview, "read", return_value={"runs": {"job": {}}}), \
+             patch.object(multiview, "api", return_value={"p": history}):
+            with self.assertRaisesRegex(RuntimeError, "已中断任务.*节点 9"):
+                multiview.wait_for_image("p", "job")
+
     def test_missing_character_settings_match_local_workflow_defaults(self):
         project = {"id": "p", "name": "test", "characters": [{"id": "c"}]}
         data = store._normalize({"projects": {"p": project}, "assets": {}, "runs": {}})
@@ -118,6 +128,8 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertIn("If the mandatory user requirements change clothing", prompt)
         self.assertNotIn("pure chroma-key green screen (#00FF00)", prompt)
         self.assertEqual(graph["4"]["inputs"]["color"], 65280)
+        self.assertEqual(graph["203"]["class_type"], "ImageRemoveAlpha+")
+        self.assertEqual(graph["200"]["inputs"]["images"], ["203", 0])
         self.assertEqual(graph["200"]["class_type"], "easy imageRemBg")
         self.assertEqual(graph["201"]["inputs"]["color"], 65280)
         self.assertEqual(graph["9"]["inputs"]["images"], ["202", 0])
@@ -146,7 +158,8 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertEqual(graph["5"]["inputs"]["steps"], 25)
         self.assertNotIn("green screen", graph["100"]["inputs"]["internal_prompt"])
         self.assertEqual(graph["7"]["inputs"]["images"], ["202", 0])
-        self.assertEqual(graph["200"]["inputs"]["images"], ["6", 0])
+        self.assertEqual(graph["203"]["inputs"]["image"], ["6", 0])
+        self.assertEqual(graph["200"]["inputs"]["images"], ["203", 0])
         self.assertNotIn("101", graph)
 
     def test_krea2_workflow_produces_four_views_without_prompt_preview(self):
@@ -238,7 +251,8 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertEqual(graph["201"]["inputs"], {
             "width": ["199", 1], "height": ["199", 2],
             "batch_size": ["199", 3], "color": 65280})
-        self.assertEqual(graph["200"]["inputs"]["images"], ["6", 0])
+        self.assertEqual(graph["203"]["inputs"]["image"], ["6", 0])
+        self.assertEqual(graph["200"]["inputs"]["images"], ["203", 0])
         self.assertEqual(graph["7"]["inputs"]["images"], ["202", 0])
 
     def test_xb_qwen_five_view_i2i_keeps_workflow_69_preset_text(self):

@@ -82,11 +82,16 @@ def _xb_manager_settings(config: dict, extra: str) -> str:
 def _attach_green_background(graph: dict, image_link: list, save_node: str,
                              width: int | list, height: int | list,
                              batch_size: int | list = 1) -> None:
-    """Remove generated backgrounds and composite the subject onto exact chroma green."""
+    """Normalize generated RGBA/RGB output before matting onto exact chroma green."""
+    # Qwen Image 2.1 may decode as RGBA. EasyUse's RMBG-1.4 path assumes RGB
+    # and crashes when torchvision.normalize receives four channels. Strip the
+    # alpha channel first; ImageRemoveAlpha+ is also a no-op for RGB inputs.
+    graph["203"] = {"class_type": "ImageRemoveAlpha+", "inputs": {
+        "image": image_link}}
     graph["200"] = {"class_type": GREEN_BG_NODE, "inputs": {
         # RMBG-2.0 is gated on Hugging Face and fails on machines without
         # explicit access. RMBG-1.4 is the public EasyUse-supported model.
-        "images": image_link, "rem_mode": "RMBG-1.4", "image_output": "Hide",
+        "images": ["203", 0], "rem_mode": "RMBG-1.4", "image_output": "Hide",
         "save_prefix": "h3studio_green_matte"}}
     graph["201"] = {"class_type": "EmptyImage", "inputs": {
         "width": width, "height": height, "batch_size": batch_size, "color": 65280}}
@@ -404,7 +409,9 @@ def build_six_view_sheet_graph(source_name: str | None, job_id: str,
     if not source_name:
         raise ValueError("六视图定装照需要先绑定人物原图")
     try:
-        workflow = json.loads(SIX_VIEW_WORKFLOW.read_text(encoding="utf-8"))
+        workflow_path = SIX_VIEW_WORKFLOW if SIX_VIEW_WORKFLOW.is_file() else next(
+            (path for path in _SIX_VIEW_WORKFLOW_CANDIDATES if path.is_file()), SIX_VIEW_WORKFLOW)
+        workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
         nodes = {node["id"]: node for node in workflow["nodes"]}
         template = str(nodes[21]["widgets_values"][0]).strip()
         model_name = str(nodes[50]["widgets_values"][0])
@@ -414,7 +421,7 @@ def build_six_view_sheet_graph(source_name: str | None, job_id: str,
         resolution = int(nodes[30]["widgets_values"][2])
         scale = nodes[10]["widgets_values"]
     except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
-        raise RuntimeError("无法读取本机六视图定装照工作流") from error
+        raise RuntimeError(f"无法读取本机六视图定装照工作流：{error}") from error
     if not template or not 1 <= steps <= 100:
         raise RuntimeError("本机六视图工作流的模板或采样步数无效")
     required_nodes = ("LayerUtility: ImageScaleByAspectRatio V2", "QwenImage21Cache",
@@ -502,7 +509,22 @@ def wait_for_image(prompt_id: str, job_id: str) -> dict:
         if history:
             status = history.get("status", {})
             if status.get("status_str") == "error":
-                raise RuntimeError(str(status.get("messages", []))[-2000:])
+                messages = status.get("messages", [])
+                interrupted = next((item[1] for item in messages
+                                    if isinstance(item, (list, tuple)) and len(item) > 1
+                                    and item[0] == "execution_interrupted"
+                                    and isinstance(item[1], dict)), None)
+                if interrupted:
+                    node = str(interrupted.get("node_id") or "ComfyUI")
+                    raise RuntimeError(f"ComfyUI 已中断任务（节点 {node}），本次没有生成完成。请重新提交。")
+                failure = next((item[1] for item in messages
+                                if isinstance(item, (list, tuple)) and len(item) > 1
+                                and item[0] == "execution_error" and isinstance(item[1], dict)), None)
+                if failure:
+                    node = str(failure.get("node_type") or failure.get("node_id") or "ComfyUI 节点")
+                    detail = str(failure.get("exception_message") or failure.get("exception_type") or "执行失败")
+                    raise RuntimeError(f"{node}：{detail[:1000]}")
+                raise RuntimeError(str(messages)[-2000:])
             return history
         time.sleep(3)
 

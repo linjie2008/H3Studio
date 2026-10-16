@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from app import generate_multiview_batch, make_multiview_job
+from server import support
 
 
 class BatchMultiviewTests(unittest.TestCase):
@@ -47,8 +48,10 @@ class BatchMultiviewTests(unittest.TestCase):
 
     def test_batch_runs_sequentially_and_skips_cancelled_job(self):
         state = {"runs": {"one": {}, "two": {"cancel_requested": True}, "three": {}}}
-        with patch("app.read", return_value=state), patch("app.change") as change, \
-                patch("app.generate_multiview") as generate:
+        # generate_multiview_batch 实现在 server.support，patch 目标随之搬家。
+        with patch.object(support, "read", return_value=state), \
+                patch.object(support, "change") as change, \
+                patch.object(support, "generate_multiview") as generate:
             generate_multiview_batch(["one", "two", "three"])
         self.assertEqual([call.args[0] for call in generate.call_args_list], ["one", "three"])
         self.assertEqual(change.call_count, 1)
