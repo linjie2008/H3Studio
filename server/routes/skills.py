@@ -61,8 +61,12 @@ def post_api_skill_agent_parameters(req, path, parts, url):
         hardware = {key: device.get(key) for key in ("name", "vram_total", "vram_free") if key in device}
     except Exception:
         hardware = {}
-    turbo4_installed = (COMFY_DIR / "models" / "loras" / "minimax_h3"
-                        / "minimax_h3_fl2v_lightx2v_turbo_4step_v0.1_comfy.safetensors").is_file()
+    four_step_names = (("minimax_h3_dmad_full_dareties_v4_step600_comfy_fro.safetensors",)
+                       if project.get("h3_lora_dmad") else
+                       ("minimax_h3_fl2v_lightx2v_turbo_4step_v0.1_comfy.safetensors",
+                        "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"))
+    turbo4_installed = all((COMFY_DIR / "models" / "loras" / "minimax_h3" / name).is_file()
+                           for name in four_step_names)
     available = {"sage_attention": sage_available, "turbo4": turbo4_installed,
                  "h3_video_vaes": [name for name in model_names("vae")
                                     if name.startswith("minimax_h3_video_vae")],

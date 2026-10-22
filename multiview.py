@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import json
 import math
+import re
 import secrets
 import shutil
 import time
@@ -22,6 +23,49 @@ NEGATIVE = (
     "missing panel, wrong number of panels, front view in back panel, cropped feet, weapon, text, labels, "
     "watermark, deformed hands, extra limbs"
 )
+ANIMAL_NEGATIVE = (NEGATIVE + ", human body, human face, human hands, "
+                   "anthropomorphic animal, mascot costume, bipedal stance, standing on two legs")
+ANIMAL_NAMES = re.compile(
+    r"土拨鼠|旱獭|猫|狗|犬|狼|狐狸|狐|兔|熊|熊猫|虎|狮|豹|鹿|马|牛|羊|猪|猴|猿|象|"
+    r"鸟|鹰|鸽|鹦鹉|鸡|鸭|鹅|鱼|鲸|海豚|鲨|蛇|蜥蜴|龟|鳄|鼠|松鼠|刺猬|浣熊|河狸|"
+    r"猫鼬|水獭|仓鼠|龙猫|企鹅|考拉|袋鼠|骆驼|斑马|长颈鹿|犀牛|河马|"
+    r"groundhog|marmot|animal|cat|dog|wolf|fox|rabbit|bear|panda|tiger|lion|"
+    r"deer|horse|cow|sheep|pig|monkey|bird|eagle|duck|fish|whale|snake|lizard|"
+    r"turtle|mouse|squirrel|otter|penguin|koala|kangaroo",
+    re.IGNORECASE,
+)
+
+
+def character_form(appearance: str, settings: dict | None = None) -> str:
+    """Resolve a character's body plan without turning animal names into people."""
+    options = settings or {}
+    selected = str(options.get("character_form") or "auto")
+    if selected in ("human", "animal", "anthropomorphic"):
+        return selected
+    description = " ".join((str(options.get("character_name") or ""), appearance))
+    if re.search(r"不(?:要|是)?拟人|非拟人|自然动物|四足动物|non[- ]?anthropomorphic", description, re.I):
+        return "animal"
+    if re.search(r"拟人|兽人|人形|anthropomorph|humanoid|mascot", description, re.I):
+        return "anthropomorphic"
+    return "animal" if ANIMAL_NAMES.search(description) else "human"
+
+
+def _animal_sheet_prompt(view_layout: str, appearance: str = "", source_name: str | None = None) -> str:
+    panels = {
+        "four": "four panels: head close-up, front whole-body view, side whole-body view, rear whole-body view",
+        "five": "five panels: front, front three-quarter, strict side, rear three-quarter, and back whole-body views",
+        "six": "six panels in a 2 by 3 grid: front head close-up, side head close-up, front whole-body, side whole-body, back whole-body, and rear three-quarter whole-body view",
+    }[view_layout]
+    source = "Use the source image to preserve the same animal's species, markings and body proportions. " if source_name else ""
+    return (
+        f"{source}Create a consistent zoological reference sheet of the SAME NATURAL ANIMAL in exactly {panels}. "
+        f"Character description: {appearance.strip()[:2200]}. "
+        "Preserve the species' real anatomy, natural locomotion, paws or hooves, tail, muzzle, fur or feathers, "
+        "and its normal number of limbs in every panel. Show the whole animal from head to tail and feet, "
+        "at consistent scale and lighting. A quadruped stays on four legs; other species use their own natural posture. "
+        "Do not turn it into a person, mascot, upright human, or human-faced creature. "
+        "Do not add human hands, shoes or clothes unless explicitly requested. No text, labels or watermark."
+    )
 KREA2_NODES = ("Krea2EditGroundedEncode", "Krea2EditModelPatch", "ImageResizeKJv2")
 XB_NODE = "XB_QwenPromptPreset"
 XB_TEXT_ENCODER = "qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot.safetensors"
@@ -40,6 +84,7 @@ _SIX_VIEW_WORKFLOW_CANDIDATES = tuple(
     ))
 SIX_VIEW_WORKFLOW = next((path for path in _SIX_VIEW_WORKFLOW_CANDIDATES if path.is_file()),
                          _SIX_VIEW_WORKFLOW_CANDIDATES[0])
+SIX_VIEW_MODEL = "qwen_image_2.1_int8_convrot.safetensors"
 
 
 def _xb_i2i_workflow_defaults() -> dict:
@@ -65,18 +110,10 @@ def _xb_i2i_workflow_defaults() -> dict:
         return {}
 
 
-def _xb_manager_settings(config: dict, extra: str) -> str:
-    try:
-        payload = json.loads(config.get("manager_settings") or "{}")
-    except (TypeError, ValueError):
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    qwen = payload.setdefault("qwen", {})
-    if not isinstance(qwen, dict):
-        qwen = payload["qwen"] = {}
-    qwen["extra_settings"] = extra
-    return json.dumps(payload, ensure_ascii=False)
+def _xb_manager_settings(extra: str) -> str:
+    # Saved workflow elements/backgrounds belong to a different ComfyUI edit.
+    # Only a character's explicit extra requirements may enter this job.
+    return json.dumps({"qwen": {"extra_settings": extra}}, ensure_ascii=False)
 
 
 def _attach_green_background(graph: dict, image_link: list, save_node: str,
@@ -101,7 +138,8 @@ def _attach_green_background(graph: dict, image_link: list, save_node: str,
     graph[save_node]["inputs"]["images"] = ["202", 0]
 
 
-def _sheet_prompt(source_name: str | None, view_layout: str, appearance: str = "") -> tuple[str, int, int]:
+def _sheet_prompt(source_name: str | None, view_layout: str, appearance: str = "",
+                  form: str = "human") -> tuple[str, int, int]:
     if view_layout == "five":
         layout = (
             "exactly five equal-width vertical panels, all showing the complete body at exactly the same scale: "
@@ -120,6 +158,8 @@ def _sheet_prompt(source_name: str | None, view_layout: str, appearance: str = "
         width, height = 1536, 1024
     else:
         raise ValueError("角色多视图布局无效")
+    if form == "animal":
+        return _animal_sheet_prompt(view_layout, appearance, source_name), width, height
     mandatory = appearance.strip()[:2200]
     user_rule = (
         "MANDATORY USER CHARACTER REQUIREMENTS — these override every default below: "
@@ -169,11 +209,13 @@ def _model_config() -> tuple[str, str, str]:
 
 
 def build_qwen_graph(source_name: str | None, preset: str, job_id: str,
-                     appearance: str = "", view_layout: str = "four") -> dict:
+                     appearance: str = "", view_layout: str = "four",
+                     settings: dict | None = None) -> dict:
     if preset not in ("fast", "stable"):
         raise ValueError("多视图生成模式无效")
     model, clip, vae = _model_config()
-    prompt, width, height = _sheet_prompt(source_name, view_layout, appearance)
+    form = character_form(appearance, settings)
+    prompt, width, height = _sheet_prompt(source_name, view_layout, appearance, form)
     graph = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": model, "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": clip, "type": "qwen_image", "device": "default"}},
@@ -182,7 +224,8 @@ def build_qwen_graph(source_name: str | None, preset: str, job_id: str,
                                                      "batch_size": 1, "color": 65280}},
         "6": {"class_type": "TextEncodeQwenImage21", "inputs": {
             "clip": ["2", 0],
-            "vae": ["3", 0], "prompt": prompt, "negative_prompt": NEGATIVE,
+            "vae": ["3", 0], "prompt": prompt,
+            "negative_prompt": ANIMAL_NEGATIVE if form == "animal" else NEGATIVE,
             "resolution": 0}},
         "7": {"class_type": "KSampler", "inputs": {
             "model": ["1", 0], "positive": ["6", 0], "negative": ["6", 1],
@@ -232,8 +275,10 @@ def build_krea2_graph(source_name: str, job_id: str, appearance: str = "",
     if not (512 <= width <= 2048 and 512 <= height <= 2048
             and width % 32 == 0 and height % 32 == 0):
         raise ValueError("Krea2 画布宽高需为 512–2048 且是 32 的倍数")
-    prompt = "Convert the character in the image to a Character Sheet showing a face close-up, front full body, side full body and back full body views"
-    if appearance.strip():
+    form = character_form(appearance, options)
+    prompt = (_animal_sheet_prompt("four", appearance, source_name) if form == "animal" else
+              "Convert the character in the image to a Character Sheet showing a face close-up, front full body, side full body and back full body views")
+    if appearance.strip() and form != "animal":
         prompt += ". Character appearance requirements: " + appearance.strip()[:1800]
     return {
         "1": {"class_type": "UNETLoader", "inputs": {
@@ -292,12 +337,17 @@ def build_xb_qwen_graph(source_name: str | None, preset: str, job_id: str,
     _require_xb_qwen()
     model, clip, vae = _model_config()
     options = settings or {}
+    form = character_form(appearance, options)
     green_background = options.get("green_background", True) not in (False, "false", 0, "0")
     workflow = _xb_i2i_workflow_defaults() if source_name else {}
     config = dict(workflow) if source_name else dict(options)
-    # A non-empty role-level preset/extra setting is an intentional override;
-    # otherwise preserve the values saved in the user's workflow 69.
+    # Studio's character controls take precedence over the saved workflow 69.
+    # The old graph ignored sampling_mode for image-to-image jobs, so selecting
+    # bypass still launched Qwen3.5 prompt enhancement before sampling.
     if source_name:
+        for key in ("output_lang", "sampling_mode", "skill_mode", "thinking"):
+            if key in options:
+                config[key] = options[key]
         for key in ("preset_text", "extra_settings"):
             if options.get(key):
                 config[key] = options[key]
@@ -322,17 +372,19 @@ def build_xb_qwen_graph(source_name: str | None, preset: str, job_id: str,
         else:
             width = snap(height * ratio)
     seed = int(options.get("seed") or config.get("seed") or secrets.randbits(32)) & 0xFFFFFFFFFFFFFFFF
-    preset_mode = "人物五视图" if view_layout == "five" else "人物四视图"
-    # Pass the character's saved XB preset text through unchanged. When blank,
-    # XB_QwenPromptPreset itself resolves its own built-in text for preset_mode.
-    saved_preset = options.get("preset_text") or (workflow.get("preset_text") if view_layout == "five" else "")
-    custom_preset = str(saved_preset or "").strip()[:4000]
+    preset_mode = ("无预设" if form == "animal" else
+                   "人物五视图" if view_layout == "five" else "人物四视图")
+    # XB's built-in four/five-view templates explicitly request headless
+    # outfit panels. Use Studio's full-person turnaround template by default;
+    # a character-specific preset remains an intentional override.
+    saved_preset = options.get("preset_text") or _sheet_prompt(None, view_layout)[0]
+    custom_preset = "" if form == "animal" else str(saved_preset or "").strip()[:4000]
     extra = str(config.get("extra_settings") or "").strip()[:2000]
-    body = appearance.strip()[:4000]
-    workflow_text = str(workflow.get("internal_prompt") or "").strip()
-    if source_name and workflow_text:
-        body = (workflow_text + ("；" + body if body else ""))[:4000]
-    body = body[:5000]
+    # Workflow 69's saved prompt belongs to the person who last edited that
+    # workflow. Reusing it here can silently replace the current character's
+    # clothes and identity even when a different portrait is bound.
+    body = (_animal_sheet_prompt(view_layout, appearance, source_name)
+            if form == "animal" else appearance.strip()[:4000])
     extra = extra[:3000]
     graph = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": model, "weight_dtype": "default"}},
@@ -342,11 +394,13 @@ def build_xb_qwen_graph(source_name: str | None, preset: str, job_id: str,
             "latent_kind": "Qwen-image", "output_lang": language,
             "io_mode": "图生图" if source_name else "文生图",
             "preset_mode": preset_mode, "three_view_text": custom_preset,
-            "skill_mode": skill_mode, "skill_name": config.get("skill_name") or "不使用", "aspect_ratio": aspect,
+            "skill_mode": "不用" if form == "animal" else skill_mode,
+            "skill_name": config.get("skill_name") or "不使用", "aspect_ratio": aspect,
             "width": width, "height": height, "batch_size": int(config.get("batch_size") or 1),
             "clip_name": config.get("clip_name") or XB_TEXT_ENCODER,
             "clip_type": config.get("clip_type") or "qwen_image", "device": config.get("device") or "default",
-            "max_length": int(config.get("max_length") or 512), "sampling_mode": sampling_mode,
+            "max_length": int(config.get("max_length") or 512),
+            "sampling_mode": "bypass" if form == "animal" else sampling_mode,
             "temperature": float(config.get("temperature") or 0.7),
             "top_k": int(config.get("top_k") or 64), "top_p": float(config.get("top_p") or 0.95),
             "min_p": float(config.get("min_p") or 0.05),
@@ -355,9 +409,10 @@ def build_xb_qwen_graph(source_name: str | None, preset: str, job_id: str,
             "thinking": config.get("thinking") in (True, "true", 1, "1"),
             "use_default_template": config.get("use_default_template", True), "mtp": config.get("mtp") or "auto",
             "internal_prompt": body,
-            "manager_settings": _xb_manager_settings(config, extra)},},
+            "manager_settings": _xb_manager_settings(extra)},},
         "4": {"class_type": "TextEncodeQwenImage21", "inputs": {
-            "clip": ["2", 0], "prompt": ["100", 0], "negative_prompt": NEGATIVE,
+            "clip": ["2", 0], "prompt": ["100", 0],
+            "negative_prompt": ANIMAL_NEGATIVE if form == "animal" else NEGATIVE,
             "resolution": max(width, height)}},
         "5": {"class_type": "KSampler", "inputs": {
             "model": ["1", 0], "positive": ["4", 0], "negative": ["4", 1],
@@ -404,7 +459,7 @@ def build_xb_qwen_graph(source_name: str | None, preset: str, job_id: str,
 
 
 def build_six_view_sheet_graph(source_name: str | None, job_id: str,
-                               appearance: str = "") -> dict:
+                               appearance: str = "", settings: dict | None = None) -> dict:
     """Use the user's Qwen-Image 2.1 six-view character-sheet workflow."""
     if not source_name:
         raise ValueError("六视图定装照需要先绑定人物原图")
@@ -414,7 +469,6 @@ def build_six_view_sheet_graph(source_name: str | None, job_id: str,
         workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
         nodes = {node["id"]: node for node in workflow["nodes"]}
         template = str(nodes[21]["widgets_values"][0]).strip()
-        model_name = str(nodes[50]["widgets_values"][0])
         clip_name = str(nodes[52]["widgets_values"][0])
         vae_name = str(nodes[54]["widgets_values"][0])
         steps = int(nodes[40]["widgets_values"][2])
@@ -429,7 +483,9 @@ def build_six_view_sheet_graph(source_name: str | None, job_id: str,
     for node_name in required_nodes:
         if node_name not in api("/object_info/" + urllib.parse.quote(node_name)):
             raise RuntimeError("ComfyUI 缺少六视图工作流节点：" + node_name)
-    prompt = ("优先遵守此角色的外观设定：" + appearance.strip()[:2200] + "。\n" if appearance.strip() else "") + template
+    form = character_form(appearance, settings)
+    prompt = (_animal_sheet_prompt("six", appearance, source_name) if form == "animal" else
+              ("优先遵守此角色的外观设定：" + appearance.strip()[:2200] + "。\n" if appearance.strip() else "") + template)
     return {
         "1": {"class_type": "LoadImage", "inputs": {"image": source_name}},
         "2": {"class_type": "LayerUtility: ImageScaleByAspectRatio V2", "inputs": {
@@ -437,13 +493,15 @@ def build_six_view_sheet_graph(source_name: str | None, job_id: str,
             "proportional_height": scale[2], "fit": scale[3], "method": scale[4],
             "round_to_multiple": scale[5], "scale_to_side": scale[6],
             "scale_to_length": scale[7], "background_color": scale[8]}},
-        "3": {"class_type": "UNETLoader", "inputs": {"unet_name": model_name, "weight_dtype": "default"}},
+        "3": {"class_type": "UNETLoader", "inputs": {"unet_name": SIX_VIEW_MODEL, "weight_dtype": "default"}},
         "4": {"class_type": "QwenImage21Cache", "inputs": {"model": ["3", 0], "device": "auto", "dtype": "default"}},
         "5": {"class_type": "CLIPLoader", "inputs": {"clip_name": clip_name, "type": "qwen_image", "device": "default"}},
         "6": {"class_type": "VAELoader", "inputs": {"vae_name": vae_name}},
         "7": {"class_type": "TextEncodeQwenImage21", "inputs": {
             "clip": ["5", 0], "images.image_1": ["2", 0], "vae": ["6", 0],
-            "prompt": prompt, "negative_prompt": "", "resolution": resolution}},
+            "prompt": prompt,
+            "negative_prompt": ANIMAL_NEGATIVE if form == "animal" else "",
+            "resolution": resolution}},
         "8": {"class_type": "EmptyLatentImage", "inputs": {"width": 1536, "height": 2048, "batch_size": 1}},
         "9": {"class_type": "KSampler", "inputs": {
             "model": ["4", 0], "positive": ["7", 0], "negative": ["7", 1],
@@ -463,14 +521,14 @@ def build_graph(source_name: str | None, preset: str, job_id: str,
     if engine == "qwen_sheet":
         if view_layout != "six":
             raise ValueError("定装照工作流只支持六视图")
-        return build_six_view_sheet_graph(source_name, job_id, appearance)
+        return build_six_view_sheet_graph(source_name, job_id, appearance, settings)
     if engine == "krea2":
         if view_layout != "four":
             raise ValueError("Krea2 辅助工作流只支持四视图")
         return build_krea2_graph(source_name or "", job_id, appearance, settings)
     if engine != "qwen":
         raise ValueError("多视图生成引擎无效")
-    return build_qwen_graph(source_name, preset, job_id, appearance, view_layout)
+    return build_qwen_graph(source_name, preset, job_id, appearance, view_layout, settings)
 
 
 def _output_paths(history: dict, node_id: str) -> list[Path]:
@@ -487,6 +545,7 @@ def _output_paths(history: dict, node_id: str) -> list[Path]:
 
 def wait_for_image(prompt_id: str, job_id: str) -> dict:
     failures = 0
+    missing_checks = 0
     while True:
         if read()["runs"][job_id].get("cancel_requested"):
             try:
@@ -507,6 +566,7 @@ def wait_for_image(prompt_id: str, job_id: str) -> dict:
             time.sleep(3)
             continue
         if history:
+            missing_checks = 0
             status = history.get("status", {})
             if status.get("status_str") == "error":
                 messages = status.get("messages", [])
@@ -526,6 +586,24 @@ def wait_for_image(prompt_id: str, job_id: str) -> dict:
                     raise RuntimeError(f"{node}：{detail[:1000]}")
                 raise RuntimeError(str(messages)[-2000:])
             return history
+        # ComfyUI does not always retain history for an interrupted prompt.
+        # Without this check the Studio poller can wait forever after the job
+        # has vanished from both history and queue (e.g. ComfyUI Interrupt).
+        try:
+            queue = api("/queue")
+        except (OSError, urllib.error.URLError, TimeoutError):
+            time.sleep(3)
+            continue
+        queued = any(isinstance(item, (list, tuple)) and len(item) > 1
+                     and str(item[1]) == prompt_id
+                     for key in ("queue_running", "queue_pending")
+                     for item in queue.get(key, []))
+        if queued:
+            missing_checks = 0
+        else:
+            missing_checks += 1
+            if missing_checks >= 3:
+                raise RuntimeError("ComfyUI 中已找不到此任务的运行记录；任务可能被中断或清空，请重新提交。")
         time.sleep(3)
 
 
@@ -548,7 +626,7 @@ def generate(job_id: str) -> None:
         engine = job.get("engine") if job.get("engine") in ("xb_qwen", "krea2", "qwen_sheet") else "qwen"
         engine_label = ({"xb_qwen": "XB Qwen 69 图生图" if source_input else "XB Qwen 68 文生图",
                          "krea2": "Krea2 辅助四视图",
-                         "qwen_sheet": "Qwen 2.1 定装照",
+                         "qwen_sheet": "Qwen 2.1 INT8 定装照",
                          "qwen": "Qwen2.1"}[engine])
         graph = build_graph(source_input.name if source_input else None, job["preset"],
                             job_id, str(job.get("appearance") or ""), view_layout, engine,

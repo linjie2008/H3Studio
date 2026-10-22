@@ -49,6 +49,18 @@ class ProductAgentTests(unittest.TestCase):
         self.assertEqual(result["proposal"], proposal)
         propose.assert_called_once()
 
+    def test_action_intent_does_not_depend_on_keyword_list(self):
+        catalog = {"project": {"id": "p1", "name": "片子", "shots": [
+            {"index": 1, "id": "s1", "name": "镜头1", "mode": "t2v", "duration": 5}]}, "assets": []}
+        with patch.object(product_agent, "catalog_for_planner", return_value=catalog), \
+             patch.object(product_agent, "prompt_provider", return_value="mimo"), \
+             patch.object(product_agent, "mimo_key", return_value="configured"), \
+             patch.object(product_agent, "_deepseek_complete", return_value='{"type":"action","name":"set_shot_field","args":{"shot_id":"s1","field":"duration","value":6}}'), \
+             patch.object(product_agent, "propose", return_value={"token": "preview", "summary": "修改时长"}):
+            result = product_agent.chat({"message": "把第1个镜头时长改为6秒",
+                                         "project_id": "p1", "shot_id": "s1"})
+        self.assertEqual(result["proposal"]["token"], "preview")
+
 
 if __name__ == "__main__":
     unittest.main()

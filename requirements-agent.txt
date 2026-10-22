@@ -1,1 +1,2 @@
 langgraph==1.2.15
+scenedetect>=0.6.4,<0.8

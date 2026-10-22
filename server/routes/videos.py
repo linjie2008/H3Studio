@@ -61,7 +61,11 @@ def get_api_videos(req, path, parts, url):
             add(result.get("file"), "imported" if run.get("kind") == "imported_video" else "clip", shot_name, shot_id)
             add(result.get("h3_file"), "h3", shot_name + " · H3 原片", shot_id)
             add(result.get("pre_refine_file"), "pre_refine", shot_name + " · 精修前", shot_id)
-        add(run.get("merged"), "merged", run.get("merged_title") or "一镜到底全片")
+        default_title = ("原生一镜到底全片" if run.get("render_strategy") == "native_single_generation"
+                         else "分段接续全片" if len(run.get("results", [])) > 1
+                         else "完整视频")
+        add(run.get("merged"), "merged", run.get("merged_title") or default_title)
+        add(run.get("smooth_cut"), "merged", "平滑剪辑版（原片保留）")
     entries.sort(key=lambda item: (item.get("kind") != "merged",
                                    -item.get("created_at", 0)))
     req.json(200, entries)

@@ -97,74 +97,13 @@ def post_api_projects_character_multiview(req, path, parts, url):
     """原 app.py 分支：`len(parts) == 6 and parts[:2] == ["api", "projects"]
                     and parts[3] == "characters" and parts[5] == "multiview"`。"""
     body = req.body_json()
-    preset = str(body.get("preset") or "fast")
-    if preset not in ("fast", "stable"):
-        raise ValueError("多视图生成模式无效")
-    view_layout = str(body.get("view_layout") or "four")
-    if view_layout not in ("four", "five", "six"):
-        raise ValueError("角色多视图布局无效")
-    multiview_engine = str(body.get("engine") or "qwen")
-    if multiview_engine not in ("xb_qwen", "qwen", "krea2", "qwen_sheet"):
-        raise ValueError("多视图生成引擎无效")
-    if multiview_engine == "krea2" and view_layout != "four":
-        raise ValueError("Krea2 辅助工作流只支持四视图")
-    if multiview_engine == "qwen_sheet" and view_layout != "six":
-        raise ValueError("定装照工作流只支持六视图")
-    if multiview_engine != "qwen_sheet" and view_layout == "six":
-        raise ValueError("六视图请选择 Qwen 2.1 定装照工作流")
     state = read()
-    project = state["projects"].get(parts[2])
     if any(item.get("kind") == "character_multiview" and item.get("project_id") == parts[2]
            and item.get("batch_id") and item.get("status") in ("queued", "running")
            for item in state["runs"].values()):
         raise ValueError("当前有角色批量任务在生成，请等待批量任务完成")
-    character = next((item for item in project.get("characters", [])
-                      if item.get("id") == parts[4]), None) if project else None
-    if not character:
-        raise ValueError("当前项目中找不到这个角色")
-    source_id = character.get("portrait_asset")
-    mode = str(body.get("mode") or "i2i")
-    if mode not in ("t2i", "i2i"):
-        raise ValueError("多视图生图模式无效")
-    if multiview_engine in ("krea2", "qwen_sheet") and mode != "i2i":
-        raise ValueError("当前定装照工作流只支持参考原图生成")
-    if mode == "i2i":
-        source = state["assets"].get(source_id)
-        if not source or source.get("project_id") != parts[2] or source.get("kind") != "image":
-            raise ValueError("图生图请先绑定当前项目的人物原图")
-    else:
-        source_id = None
-    appearance = str(body.get("appearance") or character.get("appearance") or "").strip()
-    if not appearance and mode == "t2i":
-        raise ValueError("请先填写人物外观描述")
-    if not appearance:
-        appearance = "保持人物原图身份，生成同一人物的一致多视图"
-    if any(item.get("kind") == "character_multiview" and item.get("project_id") == parts[2]
-           and item.get("character_id") == parts[4]
-           and item.get("status") in ("queued", "running") for item in state["runs"].values()):
-        raise ValueError("这个角色的多视图正在生成")
-    job_id = uid()
-    job = {"id": job_id, "kind": "character_multiview", "project_id": parts[2],
-           "character_id": parts[4], "source_asset": source_id, "preset": preset,
-           "mode": mode, "view_layout": view_layout, "engine": multiview_engine,
-           "appearance": appearance[:2200],
-           "xb_settings": {
-               "output_lang": character.get("xb_output_lang", "zh"),
-               "sampling_mode": character.get("xb_sampling_mode", "bypass"),
-               "skill_mode": character.get("xb_skill_mode", "自动"),
-               "canvas_override": character.get("xb_canvas_override", False),
-               "aspect_ratio": character.get("xb_aspect_ratio", "16:9"),
-               "width": character.get("xb_width", 1920),
-               "height": character.get("xb_height", 1088),
-               "krea_width": character.get("krea_width", 1536),
-               "krea_height": character.get("krea_height", 1024),
-               "seed": character.get("xb_seed", 0),
-               "thinking": character.get("xb_thinking", False),
-               "preset_text": character.get("xb_preset_text", ""),
-               "extra_settings": character.get("xb_extra_settings", ""),
-               "green_background": character.get("xb_green_background", True),
-           },
-           "status": "queued", "current": "等待 ComfyUI", "created_at": time.time()}
+    job = make_multiview_job(state, parts[2], parts[4], body)
+    job_id = job["id"]
     change(lambda data: data["runs"].__setitem__(job_id, job))
     threading.Thread(target=generate_multiview, args=(job_id,), daemon=True).start()
     req.json(202, job)

@@ -19,6 +19,7 @@ MODELS = {
     "reference": {
         "unet": "Minimax_H3/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
         "lora": "minimax_h3/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
+        "lora_4step": "minimax_h3/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
     },
 }
 
@@ -28,6 +29,9 @@ MODELS = {
 OPTIONAL_H3_LORAS = {
     "dmad": "minimax_h3/minimax_h3_dmad_full_dareties_v4_step600_comfy_fro.safetensors",
     "mystic": "minimax_h3/MysticXXX_MMH3-V1.safetensors",
+    # 专为单人换人训练的 LoRA（base = minimax_h3_ref2va），由“换人”开关自动挂载。
+    "character_swap": "minimax_h3/h3_character_swap_pro4500_1000.safetensors",
+    "face_swap": "minimax_h3/SS_FaceSwap_MiniMax_H3_REF2VA.safetensors",
 }
 
 # The YZ Goldfish workflow uses one hybrid FL2VA/Ref2VA checkpoint for both
@@ -57,8 +61,13 @@ SMART_PRESETS = {
 
 
 def h3_frames(seconds: float) -> int:
-    """Round up to MiniMax H3's 17k+5 grid at 24 fps."""
-    requested = max(5, math.ceil(float(seconds) * 24))
+    """Round up to MiniMax H3's 17k+5 grid at 24 fps.
+
+    ``round`` first: a length that is exactly on the grid must not gain a whole
+    17-frame pad from binary float noise (e.g. 51/24 + 56/24 == 107.00000000000001),
+    because that padding is trimmed after generation and cuts the clip's tail.
+    """
+    requested = max(5, math.ceil(round(float(seconds) * 24, 6)))
     return requested + (5 - requested) % 17
 
 
@@ -84,15 +93,28 @@ def build_h3_graph(shot: dict, settings: dict, media: dict[str, str], prefix: st
     mode = shot.get("mode", "t2v")
     if mode not in ALL_MODES:
         raise ValueError(f"未知任务模式：{mode}")
-    prompt = compile_shot_prompt(shot)
+    replace_person = mode in REFERENCE and _person_replacement_requested(shot)
+    swap_variant = str(shot.get("swap_lora") or "character")
+    if replace_person and swap_variant not in ("character", "faceswap"):
+        raise ValueError("换人 LoRA 选择无效")
+    prompt = generation_prompt(shot)
     if not prompt:
         raise ValueError("镜头提示词不能为空")
+    if replace_person and swap_variant == "faceswap" and not re.search(r"\bFaceswap\b", prompt, re.I):
+        marked = prompt.replace("detailed_description:\n[Shot 1] ",
+                                "detailed_description:\n[Shot 1] Faceswap. ", 1)
+        prompt = marked if marked != prompt else "Faceswap.\n" + prompt
     width = int(settings.get("width", 1344))
     height = int(settings.get("height", 768))
     if width < 32 or height < 32 or width % 32 or height % 32:
         raise ValueError("画布宽高需为 32 的倍数")
     context_frames = int(shot.get("continuity_frames") or 0) if shot.get("continuity_video") else 0
-    length = h3_frames(float(shot.get("duration", 5)) + context_frames / 24)
+    # A continued shot asks H3 for the guide prelude plus the authored duration.
+    # The runner snaps that duration onto H3's 17k+5 grid so the request needs no
+    # extra padding frames; padding used to be generated and then trimmed away
+    # after inference, which also cut the tail of any narration that ran long.
+    shot_duration = float(shot.get("_h3_effective_duration") or shot.get("duration", 5))
+    length = h3_frames(shot_duration + context_frames / 24)
     if length > 3600:
         raise ValueError("单镜头时长超过 H3 节点上限")
     seed = int(shot.get("seed", 42))
@@ -107,14 +129,13 @@ def build_h3_graph(shot: dict, settings: dict, media: dict[str, str], prefix: st
         raise ValueError("H3 生成速度无效，请重新选择")
     smart = speed == "smart"
     turbo = SMART_PRESETS[mode][1] if smart else speed not in ("quality", "goldfish")
-    steps = SMART_PRESETS[mode][0] if smart else 4 if speed == "turbo4" and family == "creative" else 8 if turbo else 20
+    steps = SMART_PRESETS[mode][0] if smart else 4 if speed == "turbo4" else 8 if turbo else 20
     if smart and mode in ("t2v", "i2v") and (shot.get("dialogue_text") or "<d>" in prompt):
         # Short 8-step visual previews are a poor default for speech.
         turbo, steps = False, 16
-    # Reference modes use their own eight-step LoRA, even when the project
-    # selects a creative four-step variant.  A dormant choice must not block
-    # mixed-mode projects or quietly add another sampler LoRA.
-    use_dmad = bool(settings.get("h3_lora_dmad")) and speed == "turbo4" and family == "creative"
+    # Each model family has its own four-step LoRA.  The explicit DMAD choice
+    # uses the shared H3 adapter for either family.
+    use_dmad = bool(settings.get("h3_lora_dmad")) and speed == "turbo4"
     if goldfish:
         # Match the supplied YZ workflow: DMAD is run at 0.8 alongside a
         # ten-step beta/Euler schedule, not used as the four-step preset.
@@ -130,7 +151,10 @@ def build_h3_graph(shot: dict, settings: dict, media: dict[str, str], prefix: st
     # Artistic/action LoRAs are opt-in.  Loading them only when checked keeps
     # the default workflow's VRAM footprint and appearance unchanged.
     for key, lora_name in OPTIONAL_H3_LORAS.items():
-        if key == "dmad":
+        if key in ("dmad", "character_swap", "face_swap"):
+            continue
+        if replace_person and key == "mystic":
+            # 风格 LoRA 会改写人物脸部特征，换人镜头先跳过，避免脸被改掉。
             continue
         if (not goldfish and settings.get(f"h3_lora_{key}")) or (
                 goldfish and key == "mystic" and settings.get("h3_lora_mystic", True)):
@@ -139,6 +163,17 @@ def build_h3_graph(shot: dict, settings: dict, media: dict[str, str], prefix: st
                 raise ValueError(f"{key} LoRA 强度需在 0 到 1.5 之间")
             model = g.add("LoraLoaderModelOnly", model=model, lora_name=lora_name,
                           strength_model=strength)
+    # The selected identity LoRA follows the shot's replace-person switch;
+    # the sampler-speed LoRA remains a separate project choice.
+    if (replace_person and (swap_variant == "faceswap" or mode in ("v2v", "rv2v"))
+            and (swap_variant == "faceswap" or settings.get("h3_lora_character_swap", True) is not False)):
+        swap_strength = (1.0 if swap_variant == "faceswap"
+                         else float(settings.get("h3_lora_character_swap_strength", 1.0)))
+        if not 0 <= swap_strength <= 1.5:
+            raise ValueError("character_swap LoRA 强度需在 0 到 1.5 之间")
+        model = g.add("LoraLoaderModelOnly", model=model,
+                      lora_name=OPTIONAL_H3_LORAS["face_swap" if swap_variant == "faceswap" else "character_swap"],
+                      strength_model=swap_strength)
     if goldfish and settings.get("goldfish_action_loras"):
         for lora_name, strength in GOLDFISH_ACTION_LORAS:
             model = g.add("LoraLoaderModelOnly", model=model, lora_name=lora_name,
@@ -395,9 +430,47 @@ def director_control_text(shot: dict) -> str:
     return "DIRECTOR CONTROLS — MUST FOLLOW:\n- " + "\n- ".join(instructions) if instructions else ""
 
 
+# The engine already wraps a shot as "[Shot 1] [0s-Ns] …". AI optimization and
+# third-party skills often return their own "[Shot 1]/[Shot 2]" markers, which
+# would nest a second cut inside one continuous segment.
+SHOT_MARKER_RE = re.compile(r"[\[【]\s*(?:Shot|镜头)\s*\d+\s*[\]】]\s*", re.IGNORECASE)
+
+
+def strip_shot_markers(text: str) -> str:
+    """Drop engine-owned shot labels so a segment never contains a nested cut."""
+    cleaned = SHOT_MARKER_RE.sub("", str(text or ""))
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return re.sub(r"(?m)^[ \t]+", "", cleaned).strip()
+
+
+def _shift_dialogue_window(when: str, offset: float, clip_seconds: float) -> str:
+    """Move an authored dialogue window past the continuation prelude.
+
+    The prompt describes the whole generated clip, whose first frames replay the
+    previous shot. Authored times are relative to the visible shot, so they must
+    be pushed after that prelude or the spoken words land in the trimmed head.
+    """
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(?:-|~|至)\s*"
+                         r"(\d+(?:\.\d+)?)\s*(?:s|秒)?\s*", when, re.IGNORECASE)
+    if not match or offset <= 0:
+        return when
+    start, end = (min(clip_seconds, float(value) + offset) for value in match.groups())
+    if end - start < 0.25:
+        start, end = max(0.0, min(start, clip_seconds - 0.25)), clip_seconds
+    return f"{start:g}-{end:g}s"
+
+
+def generation_prompt(shot: dict) -> str:
+    """Return the prompt actually sent to H3, including the FaceSwap author preset."""
+    if (shot.get("mode") in REFERENCE and shot.get("swap_lora") == "faceswap"
+            and shot.get("faceswap_trigger_only") and _person_replacement_requested(shot)):
+        return "Faceswap"
+    return compile_shot_prompt(shot)
+
+
 def compile_shot_prompt(shot: dict) -> str:
     """Compile the exact prompt sent to H3 from one timeline segment."""
-    description = str(shot.get("prompt") or "").strip()
+    description = strip_shot_markers(shot.get("prompt"))
     identity_picture = str(shot.get("continuity_identity_picture_tag") or "<Picture 1>")
     if shot.get("continuity_subject_relation") == "new":
         description = (
@@ -465,6 +538,10 @@ def compile_shot_prompt(shot: dict) -> str:
     controls = director_control_text(shot)
     if controls:
         description += "\n" + controls
+    context_frames = int(shot.get("continuity_frames") or 0) if shot.get("continuity_video") else 0
+    prelude = max(0.0, context_frames / 24)
+    duration = max(1, float(shot.get("_h3_effective_duration") or shot.get("duration", 5)))
+    clip_seconds = duration + prelude
     dialogue = str(shot.get("dialogue_text") or "").strip()
     if dialogue:
         speaker = str(shot.get("speaker_description") or "画面中的人物").strip()
@@ -472,9 +549,16 @@ def compile_shot_prompt(shot: dict) -> str:
         delivery = str(shot.get("dialogue_delivery") or "").strip()
         language = str(shot.get("dialogue_language") or "Chinese").strip()
         when = str(shot.get("dialogue_time") or "").strip()
-        timing = f"在 {when}，" if when else ""
+        if when:
+            when = _shift_dialogue_window(when, prelude, clip_seconds)
+            timing = f"在 {when}，"
+        elif prelude:
+            # No authored window: keep speech out of the replayed guide frames.
+            timing = f"在约 {prelude:g}s 之后，"
+        else:
+            timing = ""
         if shot.get("dialogue_voiceover"):
-            line = f"{timing}{speaker} ({speaker_id}) says in an off-screen voiceover{': ' + delivery if delivery else ''}: <d>[{language}] {dialogue}</d>. The on-screen character's lips remain completely closed."
+            line = f"{timing}{speaker} ({speaker_id}) says in an off-screen voiceover{': ' + delivery if delivery else ''}: <d>[{language}] {dialogue}</d>. Speak only the text inside <d>, exactly once, without adding or changing words. The on-screen character's lips remain completely closed."
         else:
             line = f"{timing}{speaker} ({speaker_id}) says{': ' + delivery if delivery else ''}: <d>[{language}] {dialogue}</d>"
         if shot.get("dialogue_carries_in"):
@@ -491,9 +575,18 @@ def compile_shot_prompt(shot: dict) -> str:
         description += "\n" + quoted
     if not description:
         return ""
-    duration = max(1, float(shot.get("duration", 5)))
-    shot_description = (f"[Shot 1] {description}" if shot.get("mode") in ("r2v", "v2v", "rv2v")
-                        else f"[Shot 1] [0s-{duration:g}s] {description}")
+    prelude_note = (f"[0s-{prelude:g}s] The supplied opening frames continue the preceding take: "
+                    "hold the established composition, lighting and motion, and do not begin new "
+                    "dialogue or on-screen text inside this window.")
+    if shot.get("mode") in ("r2v", "v2v", "rv2v"):
+        if prelude:
+            description = prelude_note + "\n" + description
+        shot_description = f"[Shot 1] {description}"
+    elif prelude:
+        shot_description = (f"[Shot 1] {prelude_note}\n"
+                            f"[{prelude:g}s-{clip_seconds:g}s] {description}")
+    else:
+        shot_description = f"[Shot 1] [0s-{duration:g}s] {description}"
     soundscape = str(shot.get("overall_soundscape") or "").strip()
     music = str(shot.get("non_diegetic_music") or "").strip()
     if shot.get("audio_mode") == "mute":
@@ -510,7 +603,15 @@ def compile_shot_prompt(shot: dict) -> str:
             + "non_diegetic_music: " + music)
 
 
-def lint_shot_prompt(shot: dict) -> list[dict]:
+# A pasted note such as “我发现…因为提示词不合理” sits inside the visual description
+# and is read as scene content or spoken words; H3 then produces slurred audio.
+META_NOTE_RE = re.compile(
+    r"(?:我发现|我觉得|我认为|我估计|我们应该|你给我|"
+    r"提示词(?:不合理|有问题|应该)|分镜(?:不合理|有问题)|"
+    r"旁白[^。！？\n]{0,12}(?:不合理|加速|减速|因为))")
+
+
+def lint_shot_prompt(shot: dict, settings: dict | None = None) -> list[dict]:
     """Report actionable prompt and duration issues without blocking drafts."""
     prompt = str(shot.get("prompt") or "").strip()
     findings = []
@@ -524,6 +625,23 @@ def lint_shot_prompt(shot: dict) -> list[dict]:
         add("warning", "long_prompt", "提示词超过 4000 字符，建议拆分或精简。")
     dialogue = str(shot.get("dialogue_text") or "").strip()
     if dialogue:
+        chinese_characters = len(re.findall(r"[\u4e00-\u9fff]", dialogue))
+        words = len(re.findall(r"[A-Za-z][A-Za-z']*", dialogue))
+        speaking_seconds = float(shot.get("duration") or 5)
+        # Natural pace, not the fastest pace a model can squeeze out. H3 keeps
+        # talking until the clip ends when the line does not fit, so surface the
+        # concrete overrun instead of only saying "too long".
+        needed = (chinese_characters / 4.5) if chinese_characters else (words / 2.5)
+        if needed > speaking_seconds:
+            suggested = min(15 - 0.5, math.ceil(needed * 2) / 2)
+            limit = max(1, int(speaking_seconds * 5))
+            add("warning", "voiceover_too_long",
+                f"这段旁白约需 {needed:.1f} 秒（{chinese_characters or words} 字），"
+                f"本镜只有 {speaking_seconds:g} 秒。建议延长到 {suggested:g} 秒左右，"
+                f"或把旁白压到 {limit} 字以内；否则 H3 会说到片段末尾、听感变赶。")
+        if settings and str(settings.get("generation_speed")) == "turbo4":
+            add("warning", "narration_fast_steps",
+                "极速 4 步会让旁白明显变糊。有旁白的镜头建议用 Turbo 8 步或标准 20 步。")
         if not re.fullmatch(r"S\d+", str(shot.get("speaker_id") or "S1")):
             add("error", "speaker_id", "说话人编号需使用 S1、S2 这样的格式。")
         time_range = str(shot.get("dialogue_time") or "").strip()
@@ -563,26 +681,162 @@ def lint_shot_prompt(shot: dict) -> list[dict]:
             "短镜头把人物特写放在远景或移动之后，实测易停在远景或突然跳近。请让上一段结束时已靠近人物，并让本段从近景开始。")
     if re.search(r"<(?:Picture|Video|Audio)\s*\d+>", prompt, re.I):
         refs = {"Picture": len(shot.get("ref_images") or []),
-                "Video": len(shot.get("ref_videos") or []), "Audio": len(shot.get("ref_audios") or [])}
+                "Video": len(shot.get("ref_videos") or []) + (1 if shot.get("source_video") else 0),
+                "Audio": len(shot.get("ref_audios") or [])}
         for kind, count in refs.items():
             for match in re.finditer(rf"<{kind}\s*(\d+)", prompt, re.I):
                 if int(match.group(1)) > count:
                     add("warning", "unbound_reference", f"提示词中的 {match.group(0)} 未绑定到当前镜头素材。")
                     break
+    if (shot.get("mode") in ("r2v", "v2v", "rv2v")
+            and _person_replacement_requested(shot)):
+        tuned = []
+        if settings and settings.get("h3_lora_mystic"):
+            tuned.append("已自动跳过 Mystic 风格 LoRA（它会改写脸部特征）")
+        if tuned:
+            add("ok", "identity_auto_tuned", "换人镜头为保证换脸效果：" + "；".join(tuned) + "。")
+        conflict = re.search(
+            r"(?:preserv\w*|keep|maintain|retain)\b[^.]{0,60}\b(?:subject|figure|person|man|woman)\b"
+            r"|same figure|identical figure"
+            r"|保持[^，。]{0,12}(?:主体|人物)|保留[^，。]{0,12}(?:主体|人物)"
+            r"|(?:保留|保持|沿用|不替换|别改|不改)[^，。]{0,10}原人物"
+            r"|原人物[^，。]{0,8}(?:不变|保留|不动)"
+            r"|(?:源视频|原视频|原片|源片)[^。]{0,24}(?:同一个人|同一人|保持不变|不变)",
+            prompt, re.IGNORECASE)
+        if conflict:
+            add("warning", "replace_prompt_conflict",
+                "提示词里同时写了“保留源视频主体 / 同一人物”，会和“换人”冲突；"
+                "建议改成“只保留源视频的动作、构图与节奏，人物以参考图为准”。")
+        if shot.get("ref_image_size", "match") != "max":
+            add("warning", "swap_ref_image_size",
+                "换人镜头的参考图尺寸是「匹配画布」：参考图会被压到画布面积，"
+                "服装、体型这类整片色块只剩很少像素，容易只换脸、衣服换不过来。"
+                "请把「参考图尺寸」改成「最高保真」——H3 官方节点注明 max 才是最高身份保真。")
+        if str((settings or {}).get("generation_speed") or "") == "turbo4":
+            add("warning", "swap_fast_steps",
+                "换人镜头当前是 4 步采样：4 步没有足够去噪余量去重绘参考图里的新服装，"
+                "成片容易只换脸、或衣服仍沿用源视频。建议改用 turbo（8 步）或 quality（20 步）再确认服装。")
+        if shot.get("mode") == "v2v":
+            # v2v is a pure source-video edit: runner.py only binds picture tags
+            # for r2v / rv2v, so H3 never receives the identity sheet and the
+            # swap silently degrades into "keep the source person".
+            add("warning", "swap_mode_without_reference",
+                "当前生成方式是「视频编辑」，它不会把参考图送进模型——换人不会生效，"
+                "成片仍是源视频里的人。请改成「视频＋参考」，参考图才会随镜头一起送进 H3。")
+    if shot.get("_h3_narration_duplicated"):
+        add("warning", "narration_duplicated",
+            f"这段旁白在提示词里出现了 {shot['_h3_narration_duplicated']} 次（常见于引号不配对），"
+            "实测会让 H3 重复或含糊地念，请只保留一处并补全引号。")
+    note = META_NOTE_RE.search(prompt)
+    if note:
+        snippet = prompt[max(0, note.start() - 12):note.end() + 12].replace("\n", " ")
+        add("warning", "prompt_note_leak",
+            f"提示词里混入了像备注/对话的句子，H3 会把它当画面描述或台词，"
+            f"容易导致旁白发糊，建议删掉：“…{snippet}…”")
     if not findings:
         add("ok", "ready", "未发现明显问题。")
     return findings
 
 
 def _is_identity_reference(shot: dict, asset_id: str, name: str, visual_description: str) -> bool:
-    """Only mark identity when a project character or an explicit portrait sheet binds it."""
+    """Mark identity when a character profile binds it, an explicit portrait sheet, or the shot prompt assigns this picture the person identity/replacement role."""
     metadata = (name + " " + visual_description).lower()
     characters = shot.get("_h3_characters") or []
     if any(asset_id in (item.get("portrait_asset"), item.get("multiview_asset"))
            for item in characters):
         return True
-    return any(word in metadata for word in
-               ("五视图", "四视图", "三视图", "多视图", "portrait", "face sheet", "turnaround", "multiview"))
+    if str((shot.get("ref_image_roles") or {}).get(asset_id) or "") in ("attribute_transfer", "weak_reference"):
+        # The role chosen for this reference says what it is for.  Without this
+        # the keyword heuristic below relabels an outfit sheet as "the identity
+        # reference" and invites a second person into the frame.
+        return False
+    if any(word in metadata for word in
+           ("六视图", "五视图", "四视图", "三视图", "多视图", "portrait", "face sheet", "turnaround", "multiview")):
+        return True
+    images = list(shot.get("ref_images") or [])
+    if asset_id in images:
+        if shot.get("replace_person") and len(images) == 1 and asset_id == images[0]:
+            return True
+        number = images.index(asset_id) + 1
+        prompt = str(shot.get("prompt") or "")
+        for match in re.finditer(rf"<Picture\s+{number}\b|@图片\s*{number}\b", prompt, re.IGNORECASE):
+            window = prompt[max(0, match.start() - 40):match.end() + 40].lower()
+            if any(word in window for word in
+                   ("替换", "换人", "身份", "外貌", "着装", "人像", "肖像",
+                    "replace", "identity", "appearance", "outfit")):
+                return True
+    return False
+
+
+def _requests_person_replacement(shot: dict) -> bool:
+    """Detect an explicit request to replace the source video's person with a picture.
+
+    Covers both plain wording（replace/换人）and the official Ref2VA way of stating it,
+    e.g. "whose appearance and clothing match <Picture 1>, the character reference"
+    or 「外貌与着装以 <Picture 1> 为准」.
+    """
+    text = str(shot.get("prompt") or "")
+    if re.search(r"人物.{0,10}替换|替换.{0,10}人物|换人|替换.{0,10}角色|角色.{0,10}替换", text):
+        return True
+    if re.search(r"(?:replace\w*[^.]{0,24}\b(?:person|face|identity|character)\b"
+                 r"|\b(?:person|face|identity|character)\b[^.]{0,24}replac\w*)", text, re.IGNORECASE):
+        return True
+    # Official Ref2VA phrasing: the picture is authoritative for the person's identity.
+    if re.search(r"(?:appearance|face|identity|likeness|outfit|clothing|look)\b[^.]{0,80}"
+                 r"\b(?:match(?:es)?|come(?:s)? from|taken from|based on|from|follow(?:s)?)\b[^.]{0,40}"
+                 r"<Picture\s*\d+>|<Picture\s*\d+>[^.]{0,80}"
+                 r"\b(?:appearance|face|identity|likeness|outfit|clothing)\b",
+                 text, re.IGNORECASE):
+        return True
+    if re.search(r"(?:外貌|着装|长相|形象|脸|人物|主角)[^。；;]{0,24}"
+                 r"(?:以|按|取|来自|参照|匹配)[^。；;]{0,24}<Picture\s*\d+>"
+                 r"|<Picture\s*\d+>[^。；;]{0,24}(?:为准|为身份|作为人物)", text):
+        return True
+    return False
+
+
+def _person_replacement_requested(shot: dict) -> bool:
+    """True when this shot should swap the source person for the reference person.
+
+    The explicit per-shot checkbox wins; prompt wording is only a fallback so a
+    reworded prompt can never silently drop the identity swap.
+    """
+    if shot.get("replace_person"):
+        return True
+    return _requests_person_replacement(shot)
+
+def _apply_reference_background(shot: dict, description: str, images: list, identity_images: set) -> str:
+    """Carry a reference's environment into the shot unless the author opted out.
+
+    A reference image brings its own base color and environment with it, and
+    the model only keeps that when the shot description asks for it.  Authors
+    who never wrote such a line used to get that look for free; make it
+    explicit instead of leaving it to the prompt wording.
+
+    ``ref_background``:
+      * ``auto``     — inherit from the references that are not the identity
+                        sheet (a landscape, a room, a texture), so a plain
+                        person sheet keeps the scene the model invents.
+      * ``inherit``  — inherit from every bound picture.
+      * ``authored`` — never inherit; the scene in the prompt is the scene.
+    """
+    mode = str(shot.get("ref_background") or "auto").strip()
+    if mode == "authored" or not images:
+        return description
+    if mode == "auto":
+        targets = [asset_id for asset_id in images if asset_id not in identity_images]
+    else:
+        targets = list(images)
+    if not targets:
+        return description
+    tags = " and ".join(f"<Picture {images.index(asset_id) + 1}>" for asset_id in targets)
+    clause = (f"The scene, color palette and lighting of {tags} carry over into this shot "
+               f"and define its base color")
+    if description and not description.rstrip().endswith((".", "!", "?")):
+        description = description.rstrip() + "."
+    return (description + "\n" + clause + ".").strip()
+
+
 def _compile_full_reference_prompt(shot: dict, description: str, soundscape: str, music: str) -> str:
     """Use MiniMax's six-section rewrite format for video/reference tasks."""
     mode = shot.get("mode")
@@ -608,7 +862,15 @@ def _compile_full_reference_prompt(shot: dict, description: str, soundscape: str
                                f'{detail} Preserve this person’s face, hair, build, and clothing. '
                                'Use it for the identity role requested in the detailed shot description. The user’s '
                                'description and loaded Skill determine whether any other visible property of this image '
-                               'should be used; do not add extra copies of the person by default.')
+                               'should be used; do not add extra copies of the person by default. '
+                               'Its environment, palette and lighting may also carry into the shot when the detailed '
+                               'shot description asks for them.')
+            if any(word in (name + " " + visual_description).lower() for word in
+                   ("四视图", "五视图", "六视图", "三视图", "多视图", "多视角", "multiview", "turnaround", "face sheet")):
+                definitions.append(f'<Picture {i}> is a multi-view identity sheet. Use it to lock the person’s '
+                                   'face, body proportions and outfit; never render the sheet’s grid or panels as the '
+                                   'video frame. Its environment, palette and lighting may still carry into the shot '
+                                   'when the detailed shot description asks for that.')
         else:
             definitions.append(f'<Picture {i}> is a visual reference ({name}).{detail} Its role is exactly the one '
                                'assigned to this tag in the detailed shot description. The user’s description and '
@@ -623,7 +885,9 @@ def _compile_full_reference_prompt(shot: dict, description: str, soundscape: str
         if marker not in ("fully_preserved", "partially_preserved", "attribute_transfer", "weak_reference"):
             marker = "weak_reference" if len(images) > 1 else "fully_preserved"
         explanation = {
-            "fully_preserved": ("preserve this character’s requested identity details"
+            "fully_preserved": ("preserve this character’s requested identity details, and carry over this "
+                                "reference’s environment, palette and lighting unless the detailed shot "
+                                "description explicitly replaces them"
                                 if asset_id in identity_images else
                                 "preserve the depicted content according to its explicitly assigned role and the detailed shot request"),
             "partially_preserved": "retain only details relevant to the role explicitly assigned to this reference",
@@ -637,16 +901,33 @@ def _compile_full_reference_prompt(shot: dict, description: str, soundscape: str
                            "as a separate in-frame element; equally, follow an explicit request to reproduce or combine "
                            "reference content. Let the user’s description determine subjects, actions, composition, and "
                            "which visual properties from each reference are used.")
+    replace_person = _person_replacement_requested(shot)
     for i, asset_id in enumerate(ordered_videos, 1):
         name = asset_name(asset_id)
         is_source = bool(source_video and i == 1 and asset_id == source_video)
         role = "the source video being edited" if is_source else "a video reference for motion and temporal structure"
         definitions.append(f'<Video {i}> is {role} ({name}).')
+        # 官方 ref-en.txt §4.1：partially_preserved = 仍在使用、但部分特征被改变。
+        # “保留动作/运镜、换掉人物”正是这个标记；weak_reference 只剩风格/构图大致相似，会丢动作。
         default = "partially_preserved" if is_source else "weak_reference"
         marker = (shot.get("ref_video_roles") or {}).get(asset_id, default)
         if marker not in ("fully_preserved", "partially_preserved", "attribute_transfer", "weak_reference"):
             marker = default
-        retention.append(f'<Video {i}> ({"source edit" if is_source else "motion and temporal structure"}): {marker} - the reference video role is followed in the target shot.')
+        if is_source and replace_person:
+            if marker == "weak_reference":
+                # The author demoted the source to "motion/rhythm only" — most
+                # often to rebuild the scene around the swapped person.  The
+                # generic note would still claim the framing is retained and
+                # fight the shot description, so spell the weaker contract out.
+                note = ("only the source's motion rhythm and body path are borrowed; the scene, background, "
+                        "camera framing and the person are rebuilt from this shot's description and references — "
+                        "the source's own face, body, clothing and background are not kept")
+            else:
+                note = ("the source's motion, camera movement, framing and timing are retained while the described "
+                        "person is replaced by the identity reference — the source's own face and body are not kept")
+        else:
+            note = "the reference video role is followed in the target shot"
+        retention.append(f'<Video {i}> ({"source edit" if is_source else "motion and temporal structure"}): {marker} - {note}.')
     characters = shot.get("_h3_characters") or []
     picture_index = {asset_id: i for i, asset_id in enumerate(images, 1)}
     audio_index = {asset_id: i for i, asset_id in enumerate(audios, 1)}
@@ -705,6 +986,7 @@ def _compile_full_reference_prompt(shot: dict, description: str, soundscape: str
         definitions.append("No explicit reference assets are assigned.")
     if not retention:
         retention.append("No reference assets require a retention analysis.")
+    description = _apply_reference_background(shot, description, images, identity_images)
     sections = [
         "subject_definitions:\n" + "\n".join(definitions),
         "summary:\n[" + task + "] " + summary,

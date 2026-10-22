@@ -1,8 +1,9 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app import generate_multiview_batch, make_multiview_job
 from server import support
+from server.routes import jobs as job_routes
 
 
 class BatchMultiviewTests(unittest.TestCase):
@@ -55,6 +56,25 @@ class BatchMultiviewTests(unittest.TestCase):
             generate_multiview_batch(["one", "two", "three"])
         self.assertEqual([call.args[0] for call in generate.call_args_list], ["one", "three"])
         self.assertEqual(change.call_count, 1)
+
+    def test_single_route_uses_shared_job_builder(self):
+        request = Mock()
+        request.body_json.return_value = {"mode": "i2i", "engine": "krea2",
+                                          "view_layout": "four"}
+        parts = ["api", "projects", "project", "characters", "bob", "multiview"]
+        with patch.object(job_routes, "read", return_value=self.state), \
+                patch.object(job_routes, "change") as change, \
+                patch.object(job_routes.threading, "Thread") as thread:
+            job_routes.post_api_projects_character_multiview(request, "", parts, None)
+        job = request.json.call_args.args[1]
+        self.assertEqual(request.json.call_args.args[0], 202)
+        self.assertEqual((job["character_id"], job["source_asset"], job["engine"]),
+                         ("bob", "source", "krea2"))
+        change.call_args.args[0](self.state)
+        self.assertIs(self.state["runs"][job["id"]], job)
+        thread.assert_called_once_with(target=job_routes.generate_multiview,
+                                       args=(job["id"],), daemon=True)
+        thread.return_value.start.assert_called_once_with()
 
 
 if __name__ == "__main__":

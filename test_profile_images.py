@@ -20,6 +20,13 @@ class ProfileImageGraphTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "已中断任务.*节点 9"):
                 multiview.wait_for_image("p", "job")
 
+    def test_vanished_comfy_prompt_does_not_wait_forever(self):
+        with patch.object(multiview, "read", return_value={"runs": {"job": {}}}), \
+             patch.object(multiview, "api", side_effect=[{}, {"queue_running": [], "queue_pending": []}] * 3), \
+             patch.object(multiview.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "找不到此任务的运行记录"):
+                multiview.wait_for_image("p", "job")
+
     def test_missing_character_settings_match_local_workflow_defaults(self):
         project = {"id": "p", "name": "test", "characters": [{"id": "c"}]}
         data = store._normalize({"projects": {"p": project}, "assets": {}, "runs": {}})
@@ -82,6 +89,8 @@ class ProfileImageGraphTests(unittest.TestCase):
                                           "six", "qwen_sheet")
         self.assertEqual(graph["8"]["inputs"], {"width": 1536, "height": 2048,
                                                 "batch_size": 1})
+        self.assertEqual(graph["3"]["inputs"]["unet_name"],
+                         "qwen_image_2.1_int8_convrot.safetensors")
         self.assertEqual(graph["9"]["inputs"]["steps"], 40)
         self.assertEqual(graph["7"]["inputs"]["images.image_1"], ["2", 0])
         self.assertIn("2行×3列", graph["7"]["inputs"]["prompt"])
@@ -148,7 +157,8 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertEqual(graph["100"]["class_type"], "XB_QwenPromptPreset")
         self.assertEqual(graph["100"]["inputs"]["preset_mode"], "人物五视图")
         preset_text = graph["100"]["inputs"]["three_view_text"]
-        self.assertEqual(preset_text, "")
+        self.assertIn("exactly five equal-width vertical panels", preset_text)
+        self.assertIn("head-to-toe full-body", preset_text)
         self.assertEqual(graph["100"]["inputs"]["clip_name"], multiview.XB_TEXT_ENCODER)
         self.assertIn("红色飞行员制服", graph["100"]["inputs"]["internal_prompt"])
         self.assertNotIn("pure chroma-key green screen (#00FF00)", graph["100"]["inputs"]["internal_prompt"])
@@ -206,11 +216,12 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertEqual(graph["100"]["inputs"]["preset_mode"], "人物五视图")
         self.assertEqual(graph["100"]["inputs"]["three_view_text"], "用户保存的 XB 预设设定词")
 
-    def test_xb_qwen_image_mode_matches_saved_workflow_69(self):
+    def test_xb_qwen_image_mode_uses_workflow_defaults(self):
         settings = {"aspect_ratio": "16:9", "width": 1024, "height": 1024,
                     "sampling_mode": "on"}
-        workflow = multiview._xb_i2i_workflow_defaults()
-        with patch.object(multiview, "_require_xb_qwen"), patch.object(
+        workflow = {"aspect_ratio": "4:3", "width": 1024, "height": 768}
+        with patch.object(multiview, "_xb_i2i_workflow_defaults", return_value=workflow), \
+                patch.object(multiview, "_require_xb_qwen"), patch.object(
                 multiview, "_model_config", return_value=("model", "clip", "vae")):
             graph = multiview.build_graph(
                 "portrait.png", "fast", "xb", "角色", "four", "xb_qwen", settings)
@@ -220,9 +231,10 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertEqual(graph["100"]["inputs"]["aspect_ratio"], workflow["aspect_ratio"])
         self.assertEqual(graph["100"]["inputs"]["width"], workflow["width"])
         self.assertEqual(graph["100"]["inputs"]["height"], workflow["height"])
-        self.assertEqual(graph["100"]["inputs"]["sampling_mode"], workflow["sampling_mode"])
+        self.assertEqual(graph["100"]["inputs"]["sampling_mode"], "on")
         self.assertEqual(graph["100"]["inputs"]["preset_mode"], "人物四视图")
-        self.assertEqual(graph["100"]["inputs"]["three_view_text"], "")
+        self.assertIn("four vertical panels", graph["100"]["inputs"]["three_view_text"])
+        self.assertNotIn("headless", graph["100"]["inputs"]["three_view_text"])
         self.assertIn("角色", graph["100"]["inputs"]["internal_prompt"])
         self.assertEqual(graph["4"]["inputs"]["images.image_1"], ["9", 0])
         self.assertNotIn("images.image_2", graph["4"]["inputs"])
@@ -232,6 +244,21 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertEqual(graph["201"]["inputs"]["color"], 65280)
         self.assertEqual(graph["7"]["inputs"]["images"], ["202", 0])
         self.assertEqual(graph["5"]["inputs"]["latent_image"], ["4", 2])
+
+    def test_xb_qwen_image_mode_honors_character_bypass(self):
+        with patch.object(multiview, "_require_xb_qwen"), patch.object(
+                multiview, "_model_config", return_value=("model", "clip", "vae")), \
+             patch.object(multiview, "_xb_i2i_workflow_defaults",
+                          return_value={"sampling_mode": "on", "skill_mode": "自动",
+                                        "internal_prompt": "另一个人物的军装与帽子",
+                                        "manager_settings": '{"elements":{"selected":{"background":["forest_dense"]}}}'}):
+            graph = multiview.build_graph(
+                "portrait.png", "fast", "xb-bypass", "角色", "four", "xb_qwen",
+                {"sampling_mode": "bypass", "skill_mode": "不用"})
+        self.assertEqual(graph["100"]["inputs"]["sampling_mode"], "bypass")
+        self.assertEqual(graph["100"]["inputs"]["skill_mode"], "不用")
+        self.assertEqual(graph["100"]["inputs"]["internal_prompt"], "角色")
+        self.assertNotIn("forest_dense", graph["100"]["inputs"]["manager_settings"])
 
     def test_xb_qwen_can_keep_generated_background(self):
         with patch.object(multiview, "_require_xb_qwen"), patch.object(
@@ -255,9 +282,7 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertEqual(graph["200"]["inputs"]["images"], ["203", 0])
         self.assertEqual(graph["7"]["inputs"]["images"], ["202", 0])
 
-    def test_xb_qwen_five_view_i2i_keeps_workflow_69_preset_text(self):
-        # The local workflow 69 file is user-editable, so read its default
-        # preset text from a fixed stub instead of the machine's JSON.
+    def test_xb_qwen_five_view_i2i_does_not_inherit_another_subject_preset(self):
         with patch.object(multiview, "_require_xb_qwen"), patch.object(
                 multiview, "_model_config", return_value=("model", "clip", "vae")), \
              patch.object(multiview, "_xb_i2i_workflow_defaults",
@@ -265,7 +290,8 @@ class ProfileImageGraphTests(unittest.TestCase):
             graph = multiview.build_graph(
                 "portrait.png", "fast", "xb5", "角色", "five", "xb_qwen", {})
         self.assertEqual(graph["100"]["inputs"]["preset_mode"], "人物五视图")
-        self.assertIn("生成五宫格排列", graph["100"]["inputs"]["three_view_text"])
+        self.assertIn("exactly five equal-width vertical panels",
+                      graph["100"]["inputs"]["three_view_text"])
         self.assertEqual(graph["4"]["inputs"]["images.image_1"], ["9", 0])
 
     def test_xb_qwen_i2i_uses_explicit_character_canvas(self):

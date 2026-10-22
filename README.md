@@ -21,11 +21,11 @@ SelfLift、语义桥和 H3 3D latent 放大需要重启一次 ComfyUI，以载�
 顶部状态栏可打开“产品助手”：它使用开源 LangGraph 查询产品功能地图、项目说明和当前项目摘要，并沿用设置中的 DeepSeek/小米 MiMo 回答。明确要求修改项目时，助手可规划单项受限操作，先展示改动，只有点击「确认执行」且项目版本未变化才写入；不直接启动生成或删除项目/素材文件。首次启动由 `start.sh` 通过 `uv` 安装 `requirements-agent.txt` 到独立 `.venv-agent`；不改 ComfyUI 环境。详细功能索引见 [PRODUCT_GUIDE.md](PRODUCT_GUIDE.md)。
 
 1. 重启 ComfyUI，让 H3 Studio 的三个执行节点载入。运行上面的 `start.sh`，在 Windows 浏览器打开脚本打印的地址；如果 `127.0.0.1` 无法访问，就使用脚本打印的 WSL 地址。
-2. 点击「新建项目」。工作台分为「创作」「项目设置」「视频库」；分镜脚本在创作页作为可选折叠面板。视频库集中管理生成的视频并可直接预览、下载和删除。
+2. 点击「新建项目」。工作台分为「创作」「镜头」「项目设置」「视频库」；分镜脚本在「镜头」页作为可选折叠面板。视频库集中管理生成的视频并可直接预览、下载和删除。
 3. 创作页左侧素材胶片库可切换图片、首帧、尾帧、视频和声音；点击素材卡即可选用或取消。视频页点选视频会将它绑定为当前镜头的源视频。
 4. 选择文生、首帧、首尾帧、尾帧或多参模式，填写镜头描述。多参模式最多选择 9 张图片、3 个视频和 3 个音频；参考素材可以在提示词中用 `<Picture 1>`、`<Video 1>`、`<Audio 1>` 指定。氛围、运镜、镜头速度和动作幅度会附加到提示词。
    每个镜头的「提示词语言」可选英文或中文；AI 优化会按所选语言写提示词，生成时直接使用优化后的原文。新增镜头后可点「沿用上一镜头 · 换图」，为上一镜头使用的每张图片指定替换图，提示词中的图片编号会同步替换。
-5. 设画幅、分辨率、2–15 秒时长和声音选项，点「开始生成」。底部显示镜头完成数和当前处理阶段；取消会按 ComfyUI prompt ID 停止本软件提交的当前任务。项目设置可选择极速 4 步、Turbo 8 步或标准 20 步，并单独启用 SageAttention、选择已安装的 H3 视频 VAE。4 步 LoRA 适用于文生、首帧和首尾帧；参考素材与视频参考镜头仍使用匹配的 8 步 LoRA。
+5. 设画幅、分辨率、2–15 秒时长和声音选项，点「开始生成」。底部显示镜头完成数和当前处理阶段；取消会按 ComfyUI prompt ID 停止本软件提交的当前任务。项目设置可选择极速 4 步、Turbo 8 步或标准 20 步，并单独启用 SageAttention、选择已安装的 H3 视频 VAE。4 步 LoRA 适用于全部六种生成方式：文生、首帧和首尾帧使用 FL2V 4 步 LoRA；参考主体、视频编辑、参考改视频使用 Ref2V 4 步 LoRA。
 
 基础文生流程也可在镜头时间轴中编辑，再点右侧「运行所选镜头」批量生成已勾选镜头。确认 H3 基础生成可用后，再逐项开启 SelfLift、二采、SeedVR2。
 
@@ -44,10 +44,10 @@ SelfLift、语义桥和 H3 3D latent 放大需要重启一次 ComfyUI，以载�
 - 可选的本机 YOLO 人脸检测与画面细节增强。
 - 可选语义桥（本机适配器权重）、SelfLift 低清前缀→H3 3D latent lift→高清收尾，以及原画布二采、3D latent 放大后精修或仅做 latent 放大。
 - 可使用云端 DeepSeek 优化镜头提示词，并从故事梗概生成可编辑分镜；API Key 在项目设置中配置，不会随项目包导出。
-- 每个项目可加载 MiniMax H3 官方提示词 Skill 或导入自定义 Skill（SKILL.md / ZIP）；云端 DeepSeek 优化和 AI 分镜都使用该项目绑定的 Skill。点击「预览 Skill 内容」可查看完整 SKILL.md 和参考文档。
+- Skill 列表按来源分组标注：官方（仅内置 `h3-prompt-writing`，规则来自 MiniMax 官方两份指南）、AICG3D 社区库、自定义导入；只有官方条目代表 MiniMax 规则。每个项目可加载 MiniMax H3 官方提示词 Skill 或导入自定义 Skill（SKILL.md / ZIP）；云端 DeepSeek 优化和 AI 分镜都使用该项目绑定的 Skill。点击「预览 Skill 内容」可查看完整 SKILL.md 和参考文档。
 - 已接入 [AICG3D MiniMax H3 Skill 库](https://github.com/JGRFW/comfyui-AICG3D-SKILLS)的 287 个文字 Skill。项目设置中可搜索并选择，AI 优化和 AI 分镜只加载所选 Skill 的精简参考文档；预览可查看规则。来源版本与许可证记录在 `data/skill_libraries/aicg3d/`。本集成只读取 Skill 文本，不运行其 ComfyUI 插件节点，也不替换导演台的 H3 生成图。
 - 角色四视图、地点、道具和画风档案都可点击「AI 生图描述」：先选择要优化的范围，DeepSeek 读取当前项目绑定的 Skill 和档案文字，返回可编辑的英文描述；可仅保存，或保存后直接调用现有 ComfyUI Qwen-Image 2.1 生图入口。文生图和图生图都沿用档案当前选择，生成图归入当前项目与对应档案。AI 不直接识别原图像素，图生图时原图仍由 ComfyUI 使用；生成后可在档案中选择保留哪张参考图。
-- H3 生成可选择极速 4 步、Turbo 8 步 LoRA 或标准 20 步；4 步使用已安装的 FL2VA LightX2V LoRA，参考模型自动使用 8 步。可启用 ComfyUI 的 H3 SageAttention patch，并选择已安装的 H3 视频 VAE。INT8 VAE 权重未随工作台下载；放入 `ComfyUI/models/vae/` 后会自动显示在下拉列表。
+- H3 生成可选择极速 4 步、Turbo 8 步 LoRA 或标准 20 步；4 步在 FL2VA 模式使用 LightX2V LoRA，在 Ref2VA 模式使用匹配的 Ref2V 4 步 LoRA。可启用 ComfyUI 的 H3 SageAttention patch，并选择已安装的 H3 视频 VAE。INT8 VAE 权重未随工作台下载；放入 `ComfyUI/models/vae/` 后会自动显示在下拉列表。
 - 生成视频库可在线播放预览、按项目和类型筛选、搜索、下载或删除生成文件。
 - H3 原片预览、确认后 SeedVR2 超分、分段成片或整片合并。
 - 含媒体的 H3 Studio 项目包导入导出，以及原导演台 `.mmxpack.zip` 导入和兼容格式导出。
@@ -62,7 +62,7 @@ SelfLift、语义桥和 H3 3D latent 放大需要重启一次 ComfyUI，以载�
 
 ## 实现边界
 
-软件使用 `MiniMaxH3ImageToVideo`、`MiniMaxH3ReferenceToVideo`、原生 `MiniMaxH3AddGuide`、采样、音视频解码和保存等节点构建 API 图。连续镜头把上一段的尾部视频帧作为 H3 原生帧引导，保留新镜头自己的目标 latent。接缝会保留可见引导重叠作为转场，同时从前一段尾部扣除等长帧数，合片时长保持不变。检测到相邻镜头使用不同的单张人物参考图时，会把当前镜头图片提升为强身份参考，明确要求新旧人物的脸、发型、体型和服装不同，并将前一人物的引导限制在约 39 帧，保留约 15 帧可见遮挡过渡，减少旧身份压过新参考图的情况。H3 模型仍可能生成不符合预期的画面，实际效果需要逐次检查。SelfLift、语义桥和 H3 3D latent 放大由 H3 Studio 扩展节点处理；SelfLift 和 latent 放大使用的权重位于 `ComfyUI/models/latent_upscale_models/`；语义桥适配器由用户放入 `ComfyUI/models/semantic_bridge/`，目录为空时界面只能选择关闭。原导演台的部分算法按其 Apache-2.0 许可移植，许可文件在 `comfy_extension/h3_studio_ops/LICENSE`。
+软件使用 `MiniMaxH3ImageToVideo`、`MiniMaxH3ReferenceToVideo`、原生 `MiniMaxH3AddGuide`、采样、音视频解码和保存等节点构建 API 图。连续镜头把上一段的尾部视频帧作为 H3 原生帧引导，保留新镜头自己的目标 latent。接缝会保留可见引导重叠作为转场，同时从前一段尾部扣除等长帧数，合片时长保持不变。接续镜头的有效时长会对齐到 H3 的 17k+5 帧网格（与设定值最多差 0.33 秒），并在提示词里把开头声明为延续段：新台词和画面文字都排在引导段之后。有旁白的接续镜头改用最短的合法引导（5 帧），因为 H3 只有视频引导、没有音频引导，会在第 0 帧就开始说话；生成后只裁掉「实测静音且与上一镜尾帧对齐最好」的最多 5 帧头部，不再按引导长度硬裁，因此旁白开头和结尾都不会被接缝减掉。跨接缝有旁白时合片只在该开头实测无声时才丢弃重复帧，否则整段保留，并在接缝报告里标记 `spoken_overlap`、`overlap_peak_dbfs`、`narration_mode` 与 `dropped_head_frames`。检测到相邻镜头使用不同的单张人物参考图时，会把当前镜头图片提升为强身份参考，明确要求新旧人物的脸、发型、体型和服装不同，并将前一人物的引导限制在约 39 帧，保留约 15 帧可见遮挡过渡，减少旧身份压过新参考图的情况。H3 模型仍可能生成不符合预期的画面，实际效果需要逐次检查。SelfLift、语义桥和 H3 3D latent 放大由 H3 Studio 扩展节点处理；SelfLift 和 latent 放大使用的权重位于 `ComfyUI/models/latent_upscale_models/`；语义桥适配器由用户放入 `ComfyUI/models/semantic_bridge/`，目录为空时界面只能选择关闭。原导演台的部分算法按其 Apache-2.0 许可移植，许可文件在 `comfy_extension/h3_studio_ops/LICENSE`。
 
 SeedVR2 通过单独的第二个 ComfyUI 任务执行，因此可在超分前查看当前 H3 成片。H3 二采支持 1–8 轮，并保留一采原片；二采在同一个推理任务中自动完成，尚无原导演台的确认一采后再二采或替换二采 UNET。连续镜头使用原生 H3 帧引导与标准采样；独立镜头仍可用 SelfLift。人脸细节增强是独立后处理，与原插件的局部 H3 二采算法不同。提示词优化和 AI 分镜使用云端 DeepSeek；需要在项目设置中配置 DeepSeek API Key，相关文本会发送到 DeepSeek 服务。
 

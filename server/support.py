@@ -233,6 +233,8 @@ def make_multiview_job(state: dict, project_id: str, character_id: str, body: di
             "mode": mode, "view_layout": view_layout, "engine": multiview_engine,
             "appearance": appearance[:2200],
             "xb_settings": {
+                "character_form": character.get("character_form", "auto"),
+                "character_name": character.get("name", ""),
                 "output_lang": character.get("xb_output_lang", "zh"),
                 "sampling_mode": character.get("xb_sampling_mode", "bypass"),
                 "skill_mode": character.get("xb_skill_mode", "自动"),

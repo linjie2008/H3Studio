@@ -7,7 +7,7 @@ studio_host="${H3_STUDIO_HOST:-127.0.0.1}"
 studio_url="http://127.0.0.1:$studio_port"
 comfy_url="${COMFYUI_URL:-http://127.0.0.1:8188}"
 agent_python="$studio_dir/.venv-agent/bin/python"
-if [ ! -x "$agent_python" ] || ! "$agent_python" -c 'import langgraph' >/dev/null 2>&1; then
+if [ ! -x "$agent_python" ] || ! "$agent_python" -c 'import langgraph, scenedetect' >/dev/null 2>&1; then
     if ! command -v uv >/dev/null 2>&1; then
         echo "产品助手需要 uv。安装 uv 后重试，或在 .venv-agent 中安装 requirements-agent.txt。" >&2
         exit 1
@@ -43,7 +43,7 @@ stop_studio_listener() {
 }
 
 studio_version="$(curl --noproxy '*' -fsS --max-time 3 "$studio_url/api/version" 2>/dev/null || true)"
-if [[ -n "$studio_version" && "$studio_version" != *"independent-66"* ]]; then
+if [[ -n "$studio_version" && "$studio_version" != *"independent-91"* ]]; then
     echo "正在关闭旧版工作台…"
     stop_studio_listener
     for attempt in $(seq 1 20); do

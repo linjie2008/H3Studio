@@ -154,24 +154,26 @@ def post_api_projects_split(req, path, parts, url):
         raise ValueError("请选择已上传的视频")
     spans = boundaries(ASSETS / asset["file"], body.get("method", "equal"),
                        body.get("count", 4), body.get("threshold", 0.35),
-                       body.get("custom_cuts", []))
+                       body.get("custom_cuts", []), body.get("sensitivity", "medium"))
     shots = []
     for index, (start, length) in enumerate(spans, 1):
         shot = new_shot()
         shot.update(name=f"{asset['name']} · {index}", mode="v2v", source_video=asset_id,
                     source_start=start, duration=length, prompt="保留源视频的主体、动作与构图，提升细节和光照。")
         shots.append(shot)
-    # Re-cutting from the director UI is an explicit replacement:
-    # otherwise every press kept the old pieces and made a request
-    # for four parts look like ten-plus parts in the timeline.
+    # A source video has one active split. Replace its previous segments at
+    # their original timeline position, including requests from older clients.
     def save_split(data):
         project_shots = data["projects"][parts[2]]["shots"]
-        if body.get("replace_source_segments"):
-            project_shots[:] = [item for item in project_shots if not (
-                item.get("source_video") == asset_id
-                and item.get("mode") in {"v2v", "rv2v"}
-            )]
-        project_shots.extend(shots)
+        old_positions = [index for index, item in enumerate(project_shots)
+                         if item.get("source_video") == asset_id
+                         and item.get("mode") in {"v2v", "rv2v"}]
+        insert_at = old_positions[0] if old_positions else len(project_shots)
+        project_shots[:] = [item for item in project_shots if not (
+            item.get("source_video") == asset_id
+            and item.get("mode") in {"v2v", "rv2v"}
+        )]
+        project_shots[insert_at:insert_at] = shots
     change(save_split)
     req.json(201, shots)
     return
@@ -206,10 +208,22 @@ def post_api_projects_run(req, path, parts, url):
         req.send_error(404)
         return
     body = req.body_json()
-    selected = body.get("shot_ids") or [shot["id"] for shot in project["shots"] if shot.get("selected", True)]
+    reroll_shot_id = body.get("reroll_shot_id")
+    source_run_id = body.get("source_run_id")
+    selected = ([reroll_shot_id] if reroll_shot_id else
+                body.get("shot_ids") or [shot["id"] for shot in project["shots"] if shot.get("selected", True)])
     valid = {shot["id"] for shot in project["shots"]}
     if not selected or any(item not in valid for item in selected):
         raise ValueError("请至少选择一个有效镜头")
+    if reroll_shot_id:
+        source_run = read()["runs"].get(str(source_run_id or ""))
+        if (not source_run or source_run.get("project_id") != parts[2]
+                or source_run.get("status") != "completed"
+                or not any(item.get("shot_id") == reroll_shot_id for item in source_run.get("results", []))
+                or any(item.get("native_take") for item in source_run.get("results", []))
+                or any(not item.get("file") or not (OUTPUTS / item["file"]).is_file()
+                       for item in source_run.get("results", []))):
+            raise ValueError("请先选择包含这个镜头的已完成成片，再重抽")
     assets = read()["assets"]
     foreign_assets = [asset_id for asset_id in project_asset_ids(project)
                       if asset_id in assets and assets[asset_id].get("project_id") != parts[2]]
@@ -284,6 +298,8 @@ def post_api_projects_run(req, path, parts, url):
     run_id = uid()
     run = {"id": run_id, "project_id": parts[2], "shot_ids": selected,
            "status": "queued", "current": "", "results": [], "created_at": time.time()}
+    if reroll_shot_id:
+        run.update(reroll_shot_id=reroll_shot_id, source_run_id=source_run_id)
     change(lambda data: data["runs"].__setitem__(run_id, run))
     threading.Thread(target=run_project, args=(run_id,), daemon=True).start()
     req.json(202, run)
@@ -313,6 +329,10 @@ def put_api_projects(req, path, parts, url):
     project = req.body_json()
     if project.get("id") != parts[2]:
         raise ValueError("项目 ID 不匹配")
+    project["name"] = str(project.get("name") or "").strip()
+    if not project["name"] or len(project["name"]) > 120:
+        raise ValueError("项目名称需为 1–120 字")
+    project["marked"] = bool(project.get("marked", False))
     project["width"] = align_dimension(project.get("width"), 1344)
     project["height"] = align_dimension(project.get("height"), 768)
     if project.get("memory_policy", "manual") not in ("manual", "auto_vram"):
@@ -395,6 +415,8 @@ def put_api_projects(req, path, parts, url):
     previous_subject_numbers = {item.get("id"): int(item.get("subject_number", index + 1))
                                  for index, item in enumerate(previous_project.get("characters", []))}
     for character in characters:
+        if character.get("character_form", "auto") not in ("auto", "human", "animal", "anthropomorphic"):
+            raise ValueError(f"角色“{character.get('name','')}”的体态类型无效")
         if character.get("id") in previous_subject_numbers:
             subject_number = previous_subject_numbers[character["id"]]
         else:

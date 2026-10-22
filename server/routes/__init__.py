@@ -18,6 +18,7 @@ from . import media
 from . import runs
 from . import jobs
 from . import packs
+from . import downloader
 from . import webapp
 
 ALL = [
@@ -33,12 +34,14 @@ ALL = [
     runs.ROUTES,
     jobs.ROUTES,
     packs.ROUTES,
+    downloader.ROUTES,
     webapp.ROUTES,
 ]
 
 ORDER = [
     ('GET', 'get_comfy_ws'),
     ('GET', 'get_index'),
+    ('GET', 'get_settings_hub_asset'),
     ('GET', 'get_api_version'),
     ('GET', 'get_api_ai_settings'),
     ('GET', 'get_api_ai_provider'),
@@ -68,6 +71,14 @@ ORDER = [
     ('GET', 'get_media_outputs'),
     ('POST', 'post_api_product_agent_chat'),
     ('POST', 'post_api_product_agent_confirm'),
+    ('GET', 'get_api_creative_agent_status'),
+    ('GET', 'get_api_creative_agent_runs'),
+    ('POST', 'post_api_creative_agent_run'),
+    ('POST', 'post_api_creative_agent_run_stream'),
+    ('POST', 'post_api_creative_agent_confirm_stream'),
+    ('POST', 'post_api_creative_agent_confirm'),
+    ('POST', 'post_api_creative_agent_resume'),
+    ('POST', 'post_api_creative_agent_undo'),
     ('POST', 'post_api_videos_import'),
     ('POST', 'post_api_projects_create'),
     ('POST', 'post_api_projects_clone'),
@@ -91,6 +102,7 @@ ORDER = [
     ('POST', 'post_api_prompt_preview'),
     ('POST', 'post_api_assets_upload'),
     ('POST', 'post_api_assets_extract_audio'),
+    ('POST', 'post_api_assets_batch_delete'),
     ('POST', 'post_api_packs_import'),
     ('POST', 'post_api_projects_batch_multiview'),
     ('POST', 'post_api_projects_character_multiview'),
@@ -111,6 +123,9 @@ ORDER = [
     ('PUT', 'put_api_projects'),
     ('GET', 'get_app_index'),
     ('GET', 'get_app_asset'),
+    ('POST', 'post_api_enhance_global'),
+    ('GET', 'get_api_hardware'),
+    ('POST', 'post_api_downloader_download'),
 ]
 
 

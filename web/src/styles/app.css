@@ -5,6 +5,19 @@ html, body {
 #app {
   height: 100%;
 }
+.app-head {
+  height: 56px;
+  min-height: 56px;
+  padding: 6px 14px;
+  gap: 10px;
+  flex-wrap: nowrap;
+}
+.app-head .brand .sub,
+.app-head .header-label { display: none; }
+.app-head .brand h1 { font-size: 18px; }
+.app-head .project-tools { flex: 1; min-width: 0; overflow: hidden; flex-wrap: nowrap; }
+.app-head .project-tools #projectList { flex: 1; min-width: 0; max-width: none; overflow-x: auto; }
+.app-head .head-right { flex: none; margin-left: 0; }
 .app-rail button {
   cursor: pointer;
 }
@@ -19,11 +32,31 @@ button:disabled {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 24px 28px;
+  padding: 24px clamp(16px, 4vw, 48px);
   background: #f5f5f7;
 }
-.settings-scroll .grid3 {
-  max-width: 1100px;
+.settings-scroll .grid3,
+.settings-scroll .grid2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.settings-scroll .settings-page { max-width: 900px; margin: 0 auto !important; }
+.settings-scroll .field { min-width: 0; }
+@media (max-width: 1050px) {
+  .settings-scroll .grid3,
+  .settings-scroll .grid2 {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 760px) {
+  .app-head { height: 52px; min-height: 52px; padding: 5px 8px; }
+  .app-head .brand,.app-head .head-right,.app-head .danger { display: none; }
+  .app-head .project-tools { order: 0; flex-basis: auto; }
+}
+@media (max-width: 700px) {
+  .settings-scroll .grid3,
+  .settings-scroll .grid2 {
+    grid-template-columns: 1fr;
+  }
 }
 .field select,
 .field input {

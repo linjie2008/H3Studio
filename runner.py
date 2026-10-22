@@ -29,6 +29,90 @@ COMFY_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188").rstrip("/")
 COMFY_INPUT = Path(os.environ.get("COMFYUI_INPUT_DIR", "/home/administrator/ComfyUI/input"))
 NEW_IDENTITY_CONTEXT_FRAMES = 8
 NEW_IDENTITY_VISIBLE_FRAMES = 4
+# A spoken seam keeps every audio sample, so the duplicated guide head may only
+# be dropped when that head provably carries no speech. Peak level above this
+# threshold is treated as content and the segment is appended untouched.
+SPOKEN_OVERLAP_MAX_DBFS = -26.0
+# H3 gets the guide as video only, so it starts the voiceover at frame zero even
+# when the prompt reserves the opening window. A long guide therefore forces a
+# choice between cutting words and replaying a long head; narrated handoffs use
+# the shortest valid H3 guide instead (at most one frame is dropped).
+NARRATED_HANDOFF_FRAMES = 5
+NARRATED_HANDOFF_VISIBLE = 4
+INLINE_VOICEOVER_RE = re.compile(
+    # Negated forms such as 无旁白 / 没有旁白 / 不需要旁白 are instructions, not lines.
+    r'(?<!无)(?<!没有)(?<!不需)(?<!不要)(?<!不需要)'
+    r'(?:旁白(?:响起|说道|说)?|画外音|解说(?:词)?|配音|voice[\s-]?over|narration)\s*'
+    r'(?:[:：]\s*)?'
+    r'(?:“(?P<cn>[^”\n]+)”|「(?P<corner>[^」\n]+)」|『(?P<double_corner>[^』\n]+)』|'
+    r'"(?P<ascii>[^"\n]+)"|'
+    # Unquoted form: 旁白：城市与自然在这里相遇。 — the front end already
+    # rewrites this shape, and projects written that way must still become <d>.
+    r'(?<=[:：])\s*(?P<plain>[^。！？!?\n]+[。！？!?]?)|'
+    # Unbalanced opening quote (旁白"只有开头没有收尾): take the rest of the line,
+    # otherwise the line survives inside the visual description and H3 speaks it.
+    r'[“「『"](?P<unclosed>[^”」』"\n]+[。！？!?]?))', re.IGNORECASE)
+# Quote marks and spacing that may wrap or trail an authored narration line.
+_NARRATION_TRIM = " \t\r\n\"'“”「」『』"
+_NARRATION_LEFTOVER_RE = re.compile(r"[ \t]*旁白[ \t]*[\"“「『:]?[ \t]*(?=\n|$)")
+# Directives such as 旁白：无 / narration: none mean "no narration", not a line.
+NARRATION_PLACEHOLDERS = {"无", "无旁白", "没有", "莫", "留空", "不需要", "暂无",
+                         "none", "n/a", "na", "empty", "-"}
+
+
+def _inline_voiceover(prompt: str) -> tuple[str, str]:
+    """Separate explicitly authored narration from the visual direction."""
+    lines = []
+    seen = set()
+    def take(match: re.Match) -> str:
+        line = next(value for value in match.groupdict().values() if value is not None)
+        line = line.strip(_NARRATION_TRIM)
+        if line.lower() in NARRATION_PLACEHOLDERS:
+            # Drop the directive from the visual prompt but do not speak it.
+            return ""
+        if line and line not in seen:
+            lines.append(line)
+            seen.add(line)
+        return ""
+    source = str(prompt or "")
+    visual = INLINE_VOICEOVER_RE.sub(take, source)
+    # A duplicated or partially quoted line can survive the substitution; H3 then
+    # reads it as scene content, which is what made narration sound garbled.
+    for line in lines:
+        if line and line in visual:
+            visual = visual.replace(line, "")
+    if lines:
+        # Drop a marker left dangling at a line end after its text was removed.
+        visual = _NARRATION_LEFTOVER_RE.sub("", visual)
+    visual = re.sub(r"[ \t]+([。.!?])", r"\1", visual)
+    return visual.strip(), "\n".join(line for line in lines if line)
+
+
+def _has_spoken_audio(shot: dict) -> bool:
+    return bool(str(shot.get("dialogue_text") or "").strip()
+                or _inline_voiceover(shot.get("prompt") or "")[1]) and shot.get("audio_mode") != "mute"
+
+
+def _speech_reaches_handoff(shot: dict, *, at_end: bool, overlap_frames: int) -> bool:
+    """Protect a seam unless authored speech timing leaves room for its overlap."""
+    if not _has_spoken_audio(shot):
+        return False
+    timing = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(?:-|~|至)\s*"
+                          r"(\d+(?:\.\d+)?)\s*(?:s|秒)?\s*",
+                          str(shot.get("dialogue_time") or ""), re.IGNORECASE)
+    if not timing:
+        return True
+    start, end = map(float, timing.groups())
+    if start >= end:
+        return True
+    quiet_margin = max(0, overlap_frames) / 24 + 0.2
+    return end > float(shot.get("duration") or 5) - quiet_margin if at_end else start < quiet_margin
+
+
+def _preserve_spoken_seam(previous: dict, current: dict, overlap_frames: int) -> bool:
+    return (_speech_reaches_handoff(previous, at_end=True, overlap_frames=overlap_frames)
+            or _speech_reaches_handoff(current, at_end=False, overlap_frames=overlap_frames))
+
 
 # Serialize submissions across worker threads so a model-family switch cannot
 # race another prompt between the idle check, cache release and submission.
@@ -81,6 +165,22 @@ def prepare_shot(original: dict, project: dict) -> dict:
     original = next((item for item in project.get("shots", [])
                      if item.get("id") == original.get("id")), original)
     shot = copy.deepcopy(original)
+    visual_prompt, inline_narration = _inline_voiceover(shot.get("prompt") or "")
+    if inline_narration:
+        # Never send a second narration instruction in the visual prompt.
+        duplicated = max((str(original.get("prompt") or "").count(line) for line in
+                          inline_narration.split("\n")), default=0)
+        if duplicated > 1:
+            # The same line appears twice (often with mismatched quotes); H3 then
+            # repeats or slurs it, so surface it instead of silently deduping.
+            shot["_h3_narration_duplicated"] = duplicated
+        shot["prompt"] = visual_prompt
+        existing_dialogue = str(shot.get("dialogue_text") or "").strip()
+        if not existing_dialogue:
+            shot["dialogue_text"] = inline_narration
+            shot["dialogue_voiceover"] = True
+            shot["speaker_description"] = "全片同一位普通话旁白，音色、口音和语速保持一致"
+            shot["_h3_inline_voiceover"] = True
     image_numbers = dict(project.get("reference_image_numbers") or {})
     if not image_numbers:
         image_numbers = {asset_id: index for index, (asset_id, asset) in enumerate(
@@ -148,7 +248,7 @@ def prepare_shot(original: dict, project: dict) -> dict:
                                                   if profile["id"] != matched_profiles[0]["id"]]
             selected_profiles = matched_profiles
             shot["character_ids"] = [matched_profiles[0]["id"]]
-    if shot.get("dialogue_text") and len(selected_profiles) == 1:
+    if shot.get("dialogue_text") and len(selected_profiles) == 1 and not shot.get("_h3_inline_voiceover"):
         profile_speaker = str(selected_profiles[0].get("speaker_id") or "S1")
         if shot.get("speaker_id", "S1") == "S1" and profile_speaker != "S1":
             shot["speaker_id"] = profile_speaker
@@ -156,7 +256,7 @@ def prepare_shot(original: dict, project: dict) -> dict:
             profile_name = str(selected_profiles[0].get("name") or "画面中的人物")
             profile_appearance = str(selected_profiles[0].get("appearance") or "").strip()
             shot["speaker_description"] = profile_name + ("，" + profile_appearance if profile_appearance else "")
-    if shot.get("dialogue_text") and selected_profiles:
+    if shot.get("dialogue_text") and selected_profiles and not shot.get("_h3_inline_voiceover"):
         profile_speakers = {str(item.get("speaker_id") or "S1") for item in selected_profiles}
         if str(shot.get("speaker_id") or "S1") not in profile_speakers:
             shot["dialogue_profile_speaker_mismatch"] = True
@@ -167,7 +267,7 @@ def prepare_shot(original: dict, project: dict) -> dict:
     shot["dialogue_carries_in"] = bool(previous_shot and previous_shot.get("dialogue_carries_out")
                                         and shot.get("dialogue_text"))
     shot["dialogue_carries_out_valid"] = bool(shot.get("dialogue_carries_out") and next_shot
-                                              and next_shot.get("dialogue_text"))
+                                              and _has_spoken_audio(next_shot))
     if shot["dialogue_carries_in"] and previous_shot.get("speaker_id", "S1") != shot.get("speaker_id", "S1"):
         shot["dialogue_carry_speaker_mismatch"] = True
     if shot["dialogue_carries_out_valid"] and next_shot.get("speaker_id", "S1") != shot.get("speaker_id", "S1"):
@@ -299,31 +399,59 @@ def prepare_shot(original: dict, project: dict) -> dict:
 
     def localize_picture_tags(text: str) -> str:
         def localize(match):
-            number = int(match.group(1) or match.group(2))
+            number = int(next(group for group in match.groups() if group))
             local = global_to_local.get(number, number)
             return f"<Picture {local}>"
-        return re.sub(r"<Picture\s+(\d+)>|@图片\s*(\d+)", localize, text, flags=re.IGNORECASE)
+        # Also normalize the plain Chinese alias 「图片N」, which users type in the
+        # shared prompt; H3 only understands <Picture N>, so an un-normalized
+        # alias leaves the reference unbound in the description.
+        return re.sub(r"<Picture\s+(\d+)>|@图片\s*(\d+)|(?<![<@])图片\s*(\d+)",
+                      localize, text, flags=re.IGNORECASE)
 
-    authored_shared_prompt = localize_picture_tags(str(project.get("shared_prompt") or "").strip())
-    authored_shot_prompt = localize_picture_tags(str(shot.get("prompt") or "").strip())
+    # H3 numbers the edited source video as <Video 1> and any extra reference
+    # videos after it.  A hand-edited prompt can drift to a number that has no
+    # material behind it; the model then receives a dangling reference.  Point
+    # every out-of-range video tag back at the source video, which is what
+    # "the original composition / framing / motion" always refers to.
+    bound_video_count = len(shot.get("ref_videos") or []) + (1 if shot.get("source_video") else 0)
+
+    def localize_video_tags(text: str) -> str:
+        if not shot.get("source_video"):
+            return text
+        def localize(match):
+            number = int(match.group(1))
+            if 1 <= number <= bound_video_count:
+                return match.group(0)
+            return "<Video 1>"
+        return re.sub(r"<Video\s+(\d+)>", localize, text, flags=re.IGNORECASE)
+
+    authored_shared_prompt = localize_video_tags(localize_picture_tags(str(project.get("shared_prompt") or "").strip()))
+    authored_shot_prompt = localize_video_tags(localize_picture_tags(str(shot.get("prompt") or "").strip()))
     prompt_parts = [authored_shared_prompt, *annotations, *entity_annotations, authored_shot_prompt]
     shot["prompt"] = "\n".join(part for part in prompt_parts if part)
     return shot
 
 
+# 工作流版本：只要 build_h3_graph 的行为变了（新增/移除节点、改变 LoRA 挂载、改变
+# 步数策略等），就把它加一位，让旧成片缓存自动失效——否则同一份镜头设置会命中旧缓存，
+# 把“改完引擎却没重新生成”的旧片段拼回成片。
+WORKFLOW_REVISION = "h3studio_graph_rev_2026_10_21_faceswap_prompt_preset_2"
+
+
 def _shot_signature(shot: dict, project: dict, assets: dict, previous_signature: str | None = None) -> str:
     """Stable cache key for a shot and the settings that affect its output."""
     relevant_project = {key: project.get(key) for key in (
-        "width", "height", "fps", "generation_speed", "h3_lora_dmad", "h3_lora_dmad_strength", "h3_lora_mystic", "h3_lora_mystic_strength", "attention_mode", "sage_attention", "h3_video_vae", "upscale", "upscale_resolution", "upscale_max_resolution",
+        "width", "height", "fps", "generation_speed", "h3_lora_dmad", "h3_lora_dmad_strength", "h3_lora_mystic", "h3_lora_mystic_strength", "h3_lora_character_swap", "h3_lora_character_swap_strength", "attention_mode", "sage_attention", "h3_video_vae", "upscale", "upscale_resolution", "upscale_max_resolution",
         "face_refine", "semantic_adapter", "semantic_alpha", "selflift", "selflift_scale",
         "selflift_highres_steps", "selflift_rho", "selflift_tiling", "selflift_tile_count",
         "selflift_tile_overlap", "refine_mode", "refine_steps", "refine_denoise", "refine_passes",
         "refine_width", "refine_height", "continuous_take", "continuous_render_mode", "continuity_frames", "identity_first_on_switch", "shared_refs", "shared_prompt", "image_descriptions", "clear_vram_between_shots",
     )}
+    relevant_project["workflow_revision"] = WORKFLOW_REVISION
     if shot.get("continuity"):
         # Invalidate cached generations after changing the scene-adaptive
         # handoff rules, without invalidating unrelated projects.
-        relevant_project["continuity_algorithm"] = "h3_native_scene_adaptive_continuity_v18"
+        relevant_project["continuity_algorithm"] = "h3_native_scene_adaptive_continuity_v21_grid_prelude_audio"
     elif shot.get("continuous_take"):
         relevant_project["continuity_algorithm"] = "h3studio_single_subject_prompt_v7"
     ids = {value for key in ("first_image", "last_image", "source_video") if (value := shot.get(key))}
@@ -364,6 +492,26 @@ def _continuity_policy(project: dict, shot: dict, index: int) -> dict:
     seam_redraw = 0.0
     return {"enabled": True, "frames": min(56, frames), "strength": "strong",
             "seam_redraw": seam_redraw}
+
+
+def _requests_fresh_composition(previous: dict | None, current: dict) -> bool:
+    """Use an edited transition when a shot explicitly starts at a new camera setup."""
+    if not previous:
+        return False
+    start = str(current.get("prompt") or "")[:320].lower()
+    ending = str(previous.get("prompt") or "")[-320:].lower()
+    if re.search(r"接续上一|延续上一|上一[镜段]末帧|继续上一|continue from the previous|"
+                 r"continue its camera|same unbroken take", start):
+        return False
+    close = bool(re.search(r"人物.{0,20}(?:近景|特写)|侧脸特写|面部特写|"
+                           r"close.?up|portrait", ending))
+    aerial = bool(re.search(r"高空.{0,12}(?:无人机|航拍)|广角航拍|"
+                            r"wide.{0,20}aerial|bird.?s.?eye", start))
+    if close and aerial:
+        return True
+    return bool(re.search(r"镜头起幅|the shot begins from|the shot opens|"
+                          r"camera starts from|从参考图.{0,35}起|"
+                          r"以.{0,25}为画面基准与视角来源", start))
 
 
 def _continuity_subject_relation(previous_refs, current_refs) -> str:
@@ -510,19 +658,6 @@ def _copy_asset(asset_id: str, assets: dict, *, trim_start: float | None = None,
     return name
 
 
-def _source_passthrough(shot: dict, assets: dict, destination: Path) -> None:
-    """Prepare an unselected video-edit shot from its trimmed source clip."""
-    asset = assets.get(shot.get("source_video"))
-    if not asset:
-        raise ValueError(f"源视频素材不存在：{shot.get('source_video')}")
-    source = ASSETS / asset["file"]
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(float(shot.get("source_start") or 0)),
-                    "-i", str(source), "-t", str(float(shot.get("duration") or 5)),
-                    "-map", "0:v:0", "-map", "0:a:0?", "-vf", "fps=24",
-                    "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
-                    "-c:a", "aac", "-shortest", str(destination)], check=True, timeout=600)
-
-
 def _make_media_map(shot: dict, project: dict, assets: dict) -> dict[str, str]:
     ids = set()
     for key in ("first_image", "last_image", "source_video"):
@@ -581,7 +716,26 @@ def _submit(graph: dict, run_id: str | None = None) -> str:
                            memory_switch={"from": previous or "unknown", "to": family,
                                           "status": "released", "time": time.time(),
                                           "detail": "已卸载旧模型并释放显存缓存"})
-        response = api("/prompt", {"prompt": graph, "client_id": "h3_studio"})
+        # ComfyUI can be slow to accept a prompt while the worker is decoding the
+        # previous clip or loading a model. A single 30 s timeout used to abort
+        # the whole run; retry instead and surface progress to the workbench.
+        response = None
+        for attempt in range(1, 7):
+            try:
+                client_id = f"h3_studio_{run_id}" if run_id else "h3_studio"
+                if run_id:
+                    update_run(run_id, preview_client_id=client_id)
+                response = api("/prompt", {"prompt": graph, "client_id": client_id,
+                                           "extra_data": {"preview_method": "auto"}})
+                break
+            except (TimeoutError, urllib.error.URLError, ConnectionError) as error:
+                if read()["runs"].get(run_id or "", {}).get("cancel_requested"):
+                    raise RuntimeError("用户取消任务") from error
+                if attempt == 6:
+                    raise RuntimeError(f"ComfyUI 连续 6 次未能接受任务：{error}") from error
+                if run_id:
+                    update_run(run_id, current=f"等待 ComfyUI 接受任务（{attempt}/6）：{error}")
+                time.sleep(min(5 * attempt, 20))
         if response.get("node_errors"):
             raise RuntimeError(json.dumps(response["node_errors"], ensure_ascii=False))
         _ACTIVE_MODEL_FAMILY = family
@@ -674,6 +828,7 @@ def _auto_memory_plan(width: int, height: int) -> dict:
 
 def _wait(prompt_id: str, run_id: str) -> dict:
     connection_failures = 0
+    started = time.time()
     while True:
         if read()["runs"][run_id].get("cancel_requested"):
             try:
@@ -691,7 +846,8 @@ def _wait(prompt_id: str, run_id: str) -> dict:
             connection_failures += 1
             if connection_failures >= 10:
                 raise RuntimeError(f"连续无法读取 ComfyUI 任务状态：{error}") from error
-            update_run(run_id, current=f"ComfyUI 状态暂时不可读，正在重试（{connection_failures}/10）")
+            update_run(run_id, current=(f"ComfyUI 状态暂时不可读，正在重试"
+                                        f"（{connection_failures}/10）· 已等待 {int(time.time() - started)}s"))
             time.sleep(min(3 * connection_failures, 15))
             continue
         if history:
@@ -747,22 +903,112 @@ def _tail_clip(video: Path, target: Path, frames: int) -> None:
     seconds = min(frames / 24, video_duration(video))
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-sseof", str(-seconds), "-i", str(video),
                     "-vf", "fps=24,tpad=stop_mode=clone:stop_duration=2", "-frames:v", str(frames),
-                    "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                    "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p", "-an",
                     str(target)], check=True, timeout=120)
 
 
-def _trim_prefix(video: Path, seconds: float, duration: float, visible_context_frames: int = 0) -> None:
+def _grid_duration(duration: float, context_frames: int) -> float:
+    """Snap a continued shot onto H3's frame grid.
+
+    H3 needs a length of 17k+5 frames for ``duration + context``. Snapping costs
+    at most 8 frames (0.33 s) and avoids requesting padding frames that the
+    pipeline would then trim off the clip's tail, taking narration with them.
+    ``context_frames`` must be the value used for the requested length (the
+    handoff window), not the extracted guide-clip length; mixing the two leaves
+    a full 17-frame pad behind.
+    """
+    frames = max(17, round(float(duration) * 24))
+    guide = max(0, int(context_frames))
+    remainder = (frames + guide - 5) % 17
+    if remainder:
+        down = frames - remainder
+        up = down + 17
+        frames = down if (down >= 17 and remainder <= 17 - remainder) else up
+    return frames / 24
+
+
+def _trim_plan(video: Path, shot: dict) -> dict:
+    """Decide how much of a generated continued clip may be dropped.
+
+    Dropping the duplicated guide head is only safe when it carries no speech:
+    H3 receives the guide as video only, so it can start the narration at frame
+    zero even when the prompt reserves the opening window. When that happens the
+    head is kept, which costs a few duplicated frames instead of cutting words.
+    """
+    context = max(0, int(shot.get("continuity_frames") or 0))
+    visible = max(0, int(shot.get("continuity_visible_frames") or 0))
+    effective = float(shot.get("_h3_effective_duration") or shot.get("duration", 5))
+    total = max(1, round(video_duration(video) * 24))
+    head = min(max(0, context - visible), max(0, total - 1))
+    start = head
+    output = min(max(1, round(effective * 24) + visible), total)
+    plan = {"total_frames": total, "start_frame": start, "output_frames": output,
+            "head_dropped_frames": head, "head_speech_preserved": False,
+            "head_peak_dbfs": None}
+    if head and _has_spoken_audio(shot):
+        has_audio, peak = _overlap_audio_peak(video, head / 24)
+        plan["head_peak_dbfs"] = peak
+        if has_audio and peak is not None and peak > SPOKEN_OVERLAP_MAX_DBFS:
+            plan.update(start_frame=0, output_frames=min(total, head + output),
+                        head_speech_preserved=True)
+    return plan
+
+
+def continuity_preview(shot: dict, project: dict, assets: dict) -> dict:
+    """Continuity fields the run loop would apply, computed without media.
+
+    Prompt preview and real generation must compile the same text; without this
+    the preview silently omits the continuation prelude and the handoff wording
+    that usually decide whether a seam reads as one take.
+    """
+    shots = project.get("shots", [])
+    index = next((i for i, item in enumerate(shots) if item.get("id") == shot.get("id")), -1)
+    previous = shots[index - 1] if index > 0 else None
+    continuity = _continuity_policy(project, shot, max(index, 0))
+    if previous and _requests_fresh_composition(previous, shot):
+        continuity = {"enabled": False, "frames": 0, "strength": "none"}
+    relation = "none"
+    if previous:
+        relation = _continuity_subject_relation(_shot_identity_refs(previous, project, assets),
+                                                _shot_identity_refs(shot, project, assets))
+    frames, visible = _handoff_window(relation if continuity.get("enabled") else "none",
+                                      continuity.get("frames", 0))
+    if frames and _has_spoken_audio(shot):
+        frames = min(frames, NARRATED_HANDOFF_FRAMES)
+        visible = min(visible, NARRATED_HANDOFF_VISIBLE, frames)
+    prepared = dict(shot)
+    prepared["continuous_take"] = bool(project.get("continuous_take", True)) and not (
+        previous and _requests_fresh_composition(previous, shot))
+    prepared["continuity"] = bool(frames)
+    prepared["continuity_frames"] = frames
+    prepared["continuity_visible_frames"] = visible
+    prepared["continuity_strength"] = continuity.get("strength", "none")
+    prepared["continuity_subject_relation"] = relation
+    if frames:
+        prepared["continuity_video"] = "__preview__"
+        prepared["continuity_guide_frames"] = _continuity_anchor_frames(frames)
+        prepared["_h3_effective_duration"] = _grid_duration(
+            float(shot.get("duration", 5)), frames)
+    return prepared
+
+
+def _trim_prefix(video: Path, seconds: float, duration: float, visible_context_frames: int = 0,
+                 *, start_frame: int | None = None, output_frames: int | None = None) -> None:
     target = video.with_name(video.stem + "_trim.mp4")
     # Keep a short part of the guided prefix as the visible wipe. The merge
     # path removes the same number of frames from the previous shot's tail.
-    start_frame = max(0, round(float(seconds) * 24) - max(0, int(visible_context_frames)))
-    output_frames = max(1, round(float(duration) * 24) + max(0, int(visible_context_frames)))
-    audio_start = start_frame / 24
-    audio_duration = output_frames / 24
+    # ``start_frame``/``output_frames`` come from _trim_plan, which may keep the
+    # head when it already contains speech.
+    start = (max(0, round(float(seconds) * 24) - max(0, int(visible_context_frames)))
+             if start_frame is None else max(0, int(start_frame)))
+    frames = (max(1, round(float(duration) * 24) + max(0, int(visible_context_frames)))
+              if output_frames is None else max(1, int(output_frames)))
+    audio_start = start / 24
+    audio_duration = frames / 24
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(video),
-                    "-vf", f"fps=24,trim=start_frame={start_frame}:end_frame={start_frame + output_frames},setpts=PTS-STARTPTS",
+                    "-vf", f"fps=24,trim=start_frame={start}:end_frame={start + frames},setpts=PTS-STARTPTS",
                     "-af", f"atrim=start={audio_start:.6f}:duration={audio_duration:.6f},asetpts=PTS-STARTPTS",
-                    "-frames:v", str(output_frames), "-c:v", "libx264", "-preset", "fast",
+                    "-frames:v", str(frames), "-c:v", "libx264", "-preset", "fast",
                     "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "48000", str(target)],
                    check=True, timeout=300)
     target.replace(video)
@@ -792,8 +1038,177 @@ def _trim_prefix_frames(video: Path, frames: int, target: Path) -> None:
                    check=True, timeout=300)
 
 
-def _handoff_gray_frames(video: Path) -> list[bytes]:
-    """Decode small luma frames for an inexpensive seam alignment check."""
+def _narrated_head_skip(video: Path, previous: Path | None, context_frames: int) -> int:
+    """Pick the guide head to drop for a narrated shot: silent and best aligned.
+
+    H3 starts the voiceover at frame zero because the guide carries no audio, so
+    the head cannot be dropped on length alone. Only frames whose window stays
+    below the speech threshold are candidates; among those, the one whose first
+    frame best matches the outgoing shot's last frame gives the calmest cut.
+    """
+    limit = max(0, int(context_frames))
+    if not limit or previous is None:
+        return 0
+    try:
+        before = _handoff_gray_frames(previous)
+        after = _handoff_gray_frames(video)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+    best_score, best_skip = float("inf"), 0
+    for skip in range(0, min(limit, len(after) - 1) + 1):
+        if skip:
+            has_audio, peak = _overlap_audio_peak(video, skip / 24)
+            if has_audio and peak is not None and peak > SPOKEN_OVERLAP_MAX_DBFS:
+                break
+        score = _gray_distance(before[-1], after[skip])
+        if score < best_score:
+            best_score, best_skip = score, skip
+    return best_skip
+
+
+ENTRY_FLASH_MIN_LUMA = 8.0
+ENTRY_FLASH_DECAY_SECONDS = 0.22
+
+
+def _frame_luma(video: Path, start: float = 0.0, count: int = 18) -> list[float]:
+    """Per-frame average luma (YAVG) for a short window."""
+    result = subprocess.run(
+        ["ffmpeg", "-v", "error", "-ss", f"{max(0.0, start):.4f}", "-i", str(video),
+         "-frames:v", str(max(1, int(count))),
+         "-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-",
+         "-f", "null", "-"], capture_output=True, text=True, timeout=120)
+    return [float(line.split("YAVG=")[1]) for line in result.stdout.splitlines()
+            if "YAVG=" in line]
+
+
+def _suppress_entry_flash(video: Path, target: Path | None = None,
+                          head_frames: int = 6) -> bool:
+    """Damp a bright transient in the opening frames of a generated clip.
+
+    H3 regularly emits a washed-out bright frame a few frames into a new clip.
+    At a seam that reads as a white flash. The repair is a short asymmetric luma
+    ramp (rise to the measured peak time, linear decay) that leaves audio and
+    frame count untouched; it only fires when the peak is clearly above both the
+    first frame and the settled level, so a deliberate bright opening is kept.
+    """
+    try:
+        probe = _frame_luma(video, 0.0, head_frames + 12)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    if len(probe) < head_frames + 6:
+        return False
+    settled = probe[head_frames + 2:]
+    stable = sorted(settled)[len(settled) // 2]
+    head = probe[:head_frames]
+    peak = max(head)
+    peak_index = head.index(peak)
+    if peak_index == 0 or peak < max(head[0], stable) + ENTRY_FLASH_MIN_LUMA:
+        return False
+    delta = peak - stable
+    peak_seconds = peak_index / 24
+    rise = max(peak_seconds, 1 / 24)
+    decay = max(ENTRY_FLASH_DECAY_SECONDS, 2 / 24)
+    expression = (f"clip(lum(X,Y)-{delta:.2f}*if(lt(T,{peak_seconds:.6f}),T/{rise:.6f},"
+                  f"max(0,1-(T-{peak_seconds:.6f})/{decay:.6f})),0,255)")
+    output = target or video.with_name(video.stem + "_flash.mp4")
+    try:
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(video),
+                        "-vf", f"geq=lum='{expression}':cb='cb(X,Y)':cr='cr(X,Y)'",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                        "-pix_fmt", "yuv420p", "-c:a", "copy", str(output)],
+                       check=True, timeout=900)
+        fixed = _frame_luma(output, 0.0, head_frames)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        output.unlink(missing_ok=True)
+        return False
+    if len(fixed) < head_frames or max(fixed) >= peak - 2:
+        output.unlink(missing_ok=True)
+        return False
+    if target is None:
+        output.replace(video)
+    return True
+
+
+def _trim_downloaded_shot(video: Path, shot: dict, previous: Path | None = None) -> dict:
+    """Make a downloaded continued clip usable without losing narration.
+
+    A narrated shot may only drop a head that is silent and best aligned with the
+    outgoing tail; everything after it keeps its original samples and timing.
+    A shot without speech simply drops the guide head.
+    """
+    if _has_spoken_audio(shot):
+        context = max(0, int(shot.get("continuity_frames") or 0))
+        total = max(1, round(video_duration(video) * 24))
+        skipped = min(_narrated_head_skip(video, previous, context), max(0, total - 1))
+        if skipped:
+            target = video.with_name(video.stem + "_head.mp4")
+            _trim_prefix_frames(video, skipped, target)
+            target.replace(video)
+        return {"mode": "silent_head", "total_frames": total,
+                "start_frame": skipped, "output_frames": max(1, total - skipped),
+                "head_dropped_frames": skipped, "head_speech_preserved": skipped < context,
+                "head_peak_dbfs": None}
+    plan = _trim_plan(video, shot)
+    if plan["start_frame"] or plan["output_frames"] < plan["total_frames"]:
+        _trim_prefix(video, 0, 0, start_frame=plan["start_frame"],
+                     output_frames=plan["output_frames"])
+    return {**plan, "mode": "trimmed"}
+
+
+def _retime_video_prefix_keep_audio(video: Path, skip_frames: int, target: Path) -> None:
+    """Remove repeated guide images while retaining every sample of narration.
+
+    The generated clip's first frames replay the preceding shot. Stretch the
+    remaining picture by a few percent to its original duration; narration is
+    copied without trimming, shifting, or changing its pitch.
+    """
+    total_frames = max(1, round(video_duration(video) * 24))
+    skip = max(0, min(int(skip_frames), total_frames - 2))
+    if not skip:
+        shutil.copy2(video, target)
+        return
+    scale = (total_frames - 1) / (total_frames - skip - 1)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(video),
+                    "-map", "0:v:0", "-map", "0:a:0?",
+                    "-vf", f"fps=24,trim=start_frame={skip},setpts=(PTS-STARTPTS)*{scale:.9f},fps=24",
+                    "-frames:v", str(total_frames), "-c:v", "libx264", "-preset", "fast",
+                    "-pix_fmt", "yuv420p", "-c:a", "copy", str(target)],
+                   check=True, timeout=300)
+
+
+def _dissolve_entry_keep_audio(previous: Path, current: Path, target: Path,
+                               frames: int = 12) -> None:
+    """Fade from the outgoing last image into a fresh camera setup.
+
+    The transition occupies the opening frames of the incoming clip, so no
+    dialogue samples are cut, overlapped, delayed, or sped up.
+    """
+    seconds = max(2, int(frames)) / 24
+    still = target.with_suffix(".png")
+    width, height = _video_dimensions(current)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-sseof", "-0.08",
+                    "-i", str(previous), "-frames:v", "1", "-vf", f"scale={width}:{height}",
+                    str(still)], check=True, timeout=60)
+    try:
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-loop", "1",
+                        "-framerate", "24", "-t", f"{seconds:.6f}", "-i", str(still),
+                        "-i", str(current),
+                        "-filter_complex", "[0:v]format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS[a];"
+                        "[1:v]fps=24,format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS[b];"
+                        f"[a][b]xfade=transition=fade:duration={seconds:.6f}:offset=0[v]",
+                        "-map", "[v]", "-map", "1:a:0?", "-c:v", "libx264", "-preset", "fast",
+                        "-pix_fmt", "yuv420p", "-c:a", "copy", str(target)],
+                       check=True, timeout=300)
+    finally:
+        still.unlink(missing_ok=True)
+
+
+_GRAY_FRAME_CACHE: dict[tuple, list[bytes]] = {}
+_GRAY_FRAME_CACHE_LOCK = threading.Lock()
+_GRAY_FRAME_CACHE_LIMIT = 8
+
+
+def _decode_handoff_gray_frames(video: Path) -> list[bytes]:
     result = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", str(video), "-an", "-vf", "fps=24,scale=64:64",
          "-pix_fmt", "gray", "-f", "rawvideo", "pipe:1"],
@@ -802,6 +1217,84 @@ def _handoff_gray_frames(video: Path) -> list[bytes]:
     if not result.stdout or len(result.stdout) % pixels:
         raise ValueError("无法读取衔接画面")
     return [result.stdout[i:i + pixels] for i in range(0, len(result.stdout), pixels)]
+
+
+def _handoff_gray_frames(video: Path) -> list[bytes]:
+    """Decode small luma frames for an inexpensive seam alignment check.
+
+    Alignment, exposure matching and motion bridging each decode the same pair
+    of clips. Decoding used to run 6–12 times per seam; the cache keeps one copy
+    per file revision so the seam cost stays flat.
+    """
+    try:
+        stat = video.stat()
+    except OSError:
+        return _decode_handoff_gray_frames(video)
+    key = (str(video), stat.st_mtime_ns, stat.st_size)
+    with _GRAY_FRAME_CACHE_LOCK:
+        cached = _GRAY_FRAME_CACHE.get(key)
+    if cached is not None:
+        return cached
+    frames = _decode_handoff_gray_frames(video)
+    with _GRAY_FRAME_CACHE_LOCK:
+        if len(_GRAY_FRAME_CACHE) >= _GRAY_FRAME_CACHE_LIMIT:
+            _GRAY_FRAME_CACHE.pop(next(iter(_GRAY_FRAME_CACHE)))
+        _GRAY_FRAME_CACHE[key] = frames
+    return frames
+
+
+def _views_are_stable(previous: Path, current: Path, *, blend: bool = False) -> bool:
+    """Same confidence gate used by exposure/motion repair, but never raising.
+
+    ``blend`` relaxes the correlation floor for the short seam dissolve: fading
+    two nearly matching frames is far safer than the optical-flow bridge, and a
+    slightly looser gate avoids leaving a visible jump on otherwise similar cuts.
+    """
+    try:
+        before = _handoff_gray_frames(previous)
+        after = _handoff_gray_frames(current)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    if not blend:
+        return _stable_matching_view(before, after)
+    if len(before) < 2 or len(after) < 2:
+        return False
+    last, first = before[-1], after[0]
+    mean = sum(last) / len(last)
+    contrast = (sum((value - mean) ** 2 for value in last) / len(last)) ** 0.5
+    return (contrast >= 6
+            and _gray_distance(last, first) <= contrast * 0.35
+            and _gray_correlation(last, first) >= 0.96)
+
+
+def _overlap_audio_peak(video: Path, seconds: float) -> tuple[bool, float | None]:
+    """(has_audio, peak_dbfs) for the opening window a spoken seam would drop.
+
+    ``peak_dbfs`` is None when the level could not be measured; callers must
+    treat that as "unknown" and keep the segment untouched.
+    """
+    if seconds <= 0:
+        return False, None
+    if not video.is_file():
+        return True, None
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=index", "-of", "csv=p=0", str(video)],
+            capture_output=True, text=True, timeout=30)
+        if not probe.stdout.strip():
+            return False, None
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-t", f"{seconds:.6f}",
+             "-i", str(video), "-map", "0:a:0", "-af", "volumedetect",
+             "-f", "null", "-"],
+            capture_output=True, text=True, timeout=120)
+        match = re.search(r"max_volume:\s*(-?inf|-?\d+(?:\.\d+)?)\s*dB", result.stderr)
+        if not match:
+            return True, None
+        return True, -120.0 if "inf" in match.group(1) else float(match.group(1))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return True, None
 
 
 def _select_handoff_tail_trim(previous: Path, current: Path, requested_frames: int) -> tuple[int, float | None, float | None]:
@@ -872,6 +1365,29 @@ def _select_handoff_alignment(previous: Path, current: Path, requested_frames: i
         return tail, prefix, round(baseline, 3), round(score, 3)
     except (OSError, ValueError, subprocess.SubprocessError):
         return requested, 0, None, None
+
+
+def _select_voiced_overlap_skip(previous: Path, current: Path,
+                                requested_frames: int) -> tuple[int, float | None, float | None]:
+    """Find the replayed preceding frame at the start of a narrated clip."""
+    requested = max(0, int(requested_frames))
+    if not requested:
+        return 0, None, None
+    try:
+        before, after = _handoff_gray_frames(previous), _handoff_gray_frames(current)
+        if not before or len(after) < 3:
+            return 0, None, None
+        limit = min(requested + 2, len(after) - 2)
+        distances = [_gray_distance(before[-1], frame) for frame in after[:limit + 1]]
+        best = min(range(len(distances)), key=distances.__getitem__)
+        initial, matched = distances[0], distances[best]
+        # Do not advance an unrelated composition. The matched frame must be
+        # clearly closer to the outgoing frame and occur near the guide window.
+        if best < 2 or matched >= initial * 0.72:
+            return 0, round(initial, 3), round(matched, 3)
+        return best, round(initial, 3), round(matched, 3)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0, None, None
 
 
 def _gray_distance(first: bytes, second: bytes) -> float:
@@ -1029,29 +1545,64 @@ def _audio_mode(video: Path, source_video: Path | None, mode: str) -> None:
     temp.replace(video)
 
 
+def _write_merge_audio(videos: list[Path], target: Path) -> None:
+    """Join decoded samples at the exact segment boundaries, without overlap.
+
+    A sample clock avoids concat-demuxer timestamp rounding and AAC priming
+    at every cut. Only codec padding outside each picture's duration is
+    removed; missing audio is filled with silence.
+    """
+    with target.open("wb") as master:
+        for path in videos:
+            info = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(path)],
+                capture_output=True, text=True, check=True, timeout=30)
+            streams = json.loads(info.stdout).get("streams", [])
+            picture = next(stream for stream in streams if stream.get("codec_type") == "video")
+            seconds = float(picture.get("duration") or video_duration(path))
+            samples = round(seconds * 48000)
+            has_audio = any(stream.get("codec_type") == "audio" for stream in streams)
+            command = ["ffmpeg", "-v", "error"]
+            if has_audio:
+                command += ["-i", str(path), "-map", "0:a:0"]
+            else:
+                command += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+            command += ["-af", f"aresample=48000,apad=whole_len={samples},atrim=end_sample={samples}",
+                        "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", "-f", "s16le", "pipe:1"]
+            subprocess.run(command, stdout=master, check=True, timeout=600)
+
+
 def _merge(videos: list[Path], target: Path, width: int, height: int) -> None:
     normalized = []
     for index, path in enumerate(videos):
         info = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(path)],
                               capture_output=True, text=True, check=True, timeout=30)
         has_audio = any(stream.get("codec_type") == "audio" for stream in json.loads(info.stdout).get("streams", []))
-        output = target.with_name(f"merge_norm_{index:03d}.mp4")
+        output = target.with_name(f"merge_norm_{index:03d}.mkv")
         command = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path)]
         if not has_audio:
             command += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
         command += ["-map", "0:v:0", "-map", "0:a:0" if has_audio else "1:a:0",
-                    "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps=24",
-                    "-af", "apad", "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                    "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps=24,setpts=PTS-STARTPTS",
+                    "-af", "aresample=48000:async=1:first_pts=0,asetpts=PTS-STARTPTS,apad",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                    "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
                     "-shortest", str(output)]
         subprocess.run(command, check=True, timeout=600)
         normalized.append(output)
     manifest = target.with_suffix(".txt")
     manifest.write_text("".join("file '" + str(path).replace("'", "'\\''") + "'\n" for path in normalized))
+    audio_master = target.with_suffix(".audio.s16le")
     try:
+        _write_merge_audio(videos, audio_master)
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
-                        "-i", str(manifest), "-c", "copy", str(target)], check=True, timeout=600)
+                        "-i", str(manifest), "-f", "s16le", "-ar", "48000", "-ac", "2",
+                        "-i", str(audio_master), "-map", "0:v:0", "-map", "1:a:0",
+                        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                        "-ar", "48000", "-ac", "2", "-movflags", "+faststart",
+                        str(target)], check=True, timeout=600)
     finally:
+        audio_master.unlink(missing_ok=True)
         manifest.unlink(missing_ok=True)
         for path in normalized:
             path.unlink(missing_ok=True)
@@ -1059,10 +1610,71 @@ def _merge(videos: list[Path], target: Path, width: int, height: int) -> None:
 
 def _append_merge_item(merge_items: list[Path], seam_adjustments: list[dict], path: Path,
                        item: dict, item_index: int, output_dir: Path, project: dict,
-                       file_prefix: str = "merge") -> None:
+                       file_prefix: str = "merge", preserve_spoken_audio: bool = False) -> None:
+    if merge_items and item.get("transition_mode") == "dissolve":
+        transitioned = output_dir / f"{file_prefix}_dissolve_{item_index:03d}.mp4"
+        _dissolve_entry_keep_audio(merge_items[-1], path, transitioned)
+        seam_adjustments.append({"into_shot_id": item.get("shot_id"),
+                                 "transition_mode": "dissolve", "transition_frames": 12,
+                                 "audio_preserved": True})
+        merge_items.append(transitioned)
+        return
+    flash_fixed = output_dir / f"{file_prefix}_flash_{item_index:03d}.mp4"
+    if _suppress_entry_flash(path, flash_fixed):
+        path = flash_fixed
     visible_frames = max(0, int(item.get("handoff_visible_frames", 0) or 0))
     if visible_frames and merge_items:
         mode = project.get("seam_mode", "auto")
+        if preserve_spoken_audio:
+            # Spoken seams never trim the outgoing tail. The duplicated guide head
+            # is either dropped at the frame that is both silent and best aligned,
+            # or hidden behind a short dissolve: both keep every audio sample.
+            has_audio, peak = _overlap_audio_peak(path, visible_frames / 24)
+            quiet = not has_audio or (peak is not None and peak <= SPOKEN_OVERLAP_MAX_DBFS)
+            report = {"into_shot_id": item.get("shot_id"),
+                      "requested_trim_frames": visible_frames,
+                      "selected_trim_frames": 0,
+                      "skipped_prefix_frames": 0,
+                      "audio_preserved": True, "audio_video_timeline_preserved": True,
+                      "spoken_overlap": "silent" if quiet else ("unknown" if peak is None else "speech"),
+                      "overlap_peak_dbfs": peak}
+            if quiet:
+                # Align the cut instead of blindly dropping the visible window.
+                skip = _narrated_head_skip(path, merge_items[-1], visible_frames)
+                report["skipped_prefix_frames"] = skip
+                if skip:
+                    trimmed_head = output_dir / f"{file_prefix}_spoken_head_{item_index:03d}.mp4"
+                    _trim_prefix_frames(path, skip, trimmed_head)
+                    path = trimmed_head
+                elif _views_are_stable(merge_items[-1], path, blend=True):
+                    dissolve_frames = max(2, min(visible_frames, 6))
+                    blended = output_dir / f"{file_prefix}_spoken_blend_{item_index:03d}.mp4"
+                    _dissolve_entry_keep_audio(merge_items[-1], path, blended, dissolve_frames)
+                    path = blended
+                    report["transition_mode"] = "dissolve"
+                    report["transition_frames"] = dissolve_frames
+            elif _views_are_stable(merge_items[-1], path, blend=True):
+                # Speech occupies the duplicated head, so time cannot be removed.
+                # Fade that head out of the outgoing last frame instead; audio and
+                # clip length stay untouched.
+                dissolve_frames = max(2, min(visible_frames, 6))
+                blended = output_dir / f"{file_prefix}_spoken_blend_{item_index:03d}.mp4"
+                _dissolve_entry_keep_audio(merge_items[-1], path, blended, dissolve_frames)
+                path = blended
+                report["transition_mode"] = "dissolve"
+                report["transition_frames"] = dissolve_frames
+            exposure_enabled = mode == "auto" or (mode == "manual" and project.get("seam_exposure", True))
+            if exposure_enabled:
+                matched_current = output_dir / f"{file_prefix}_spoken_exposure_{item_index:03d}.mp4"
+                exposure_before, exposure_after, gain = _match_handoff_exposure(
+                    merge_items[-1], path, matched_current)
+                if exposure_after is not None:
+                    path = matched_current
+                    report.update({"exposure_score_before": exposure_before,
+                                   "exposure_score_after": exposure_after, "exposure_gain": gain})
+            seam_adjustments.append(report)
+            merge_items.append(path)
+            return
         max_prefix = (0 if mode == "conservative" else
                       max(0, min(3, int(project.get("seam_prefix_frames", 3)))) if mode == "manual" else 3)
         chosen_frames, skipped_frames, before_score, after_score = _select_handoff_alignment(
@@ -1102,6 +1714,16 @@ def _append_merge_item(merge_items: list[Path], seam_adjustments: list[dict], pa
     merge_items.append(path)
 
 
+def _reroll_result_list(source_items: list[dict], shot_id: str, replacement: dict) -> list[dict]:
+    """Replace exactly one segment while preserving all other saved files and order."""
+    if sum(item.get("shot_id") == shot_id for item in source_items) != 1:
+        raise ValueError("原成片中无法唯一定位要重抽的镜头")
+    if replacement.get("shot_id") != shot_id or not replacement.get("file"):
+        raise ValueError("重抽结果与选定镜头不一致")
+    return [replacement if item.get("shot_id") == shot_id else item.copy()
+            for item in source_items]
+
+
 def remerge_run(run_id: str, project: dict) -> dict:
     """Apply current project seam settings to saved segment files, without rerendering H3."""
     run = read()["runs"].get(run_id)
@@ -1115,13 +1737,18 @@ def remerge_run(run_id: str, project: dict) -> dict:
     stamp = str(time.time_ns())
     paths: list[Path] = []
     seams: list[dict] = []
+    shot_by_id = {shot.get("id"): shot for shot in project.get("shots", [])}
     for index, item in enumerate(items):
+        current_shot = shot_by_id.get(item.get("shot_id"), {})
+        previous_shot = shot_by_id.get(items[index - 1].get("shot_id"), {}) if index else {}
+        voiced = _preserve_spoken_seam(previous_shot, current_shot,
+                                       int(item.get("handoff_visible_frames") or 0))
         _append_merge_item(paths, seams, OUTPUTS / item["file"], item, index,
-                           output_dir, project, f"remerge_{stamp}")
+                           output_dir, project, f"remerge_{stamp}", voiced)
     merged = output_dir / f"merged_remerge_{stamp}.mp4"
     _merge(paths, merged, int(project.get("width", 1024)), int(project.get("height", 576)))
     update_run(run_id, merged=str(merged.relative_to(OUTPUTS)),
-               merge_seam_algorithm="adaptive_structural_v5", merge_seam_adjustments=seams,
+               merge_seam_algorithm="adaptive_structural_v6_continuous_audio", merge_seam_adjustments=seams,
                remerged_at=time.time(), remerge_settings={key: project.get(key) for key in
                                                           ("seam_mode", "seam_prefix_frames",
                                                            "seam_motion_frames", "seam_exposure")})
@@ -1139,7 +1766,7 @@ def _native_take_shot(shots: list[dict], project: dict) -> dict | None:
         return None
     if any(shot.get("mode") != "r2v" or shot.get("source_video")
            or shot.get("first_image") or shot.get("last_image")
-           or shot.get("dialogue_text") for shot in shots):
+           or _has_spoken_audio(shot) for shot in shots):
         return None
     duration = sum(float(shot.get("duration") or 5) for shot in shots)
     if duration > 15:
@@ -1220,12 +1847,21 @@ def _run_native_take(run_id: str, shot: dict, project: dict, assets: dict,
                active_stage="", active_shot_id="", active_prefix="")
 
 
+def _selected_results_for_merge(shots: list[dict], selected_ids: set[str],
+                                results: list[dict]) -> list[tuple[dict, dict]]:
+    """Only authored shots selected for this run belong in its normal export."""
+    by_id = {item["shot_id"]: item for item in results}
+    return [(shot, by_id[shot["id"]]) for shot in shots
+            if shot["id"] in selected_ids and shot["id"] in by_id]
+
+
 def run_project(run_id: str) -> None:
     """Process selected shots sequentially; keep results even if a later shot fails."""
     state = read()
     run = state["runs"][run_id]
     assets = state["assets"]
     project = normalized_project_image_references(state["projects"][run["project_id"]], assets)
+    source_run = state["runs"].get(run.get("source_run_id")) if run.get("reroll_shot_id") else None
     output_dir = OUTPUTS / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
     results = []
@@ -1248,15 +1884,32 @@ def run_project(run_id: str) -> None:
             _run_native_take(run_id, native_take, project, assets, output_dir, len(shots))
             return
         update_run(run_id, render_strategy="segmented_continuation" if len(shots) > 1 else "single_shot")
+        reused_shot_ids: list[str] = []
         for index, original in enumerate(shots):
             if read()["runs"][run_id].get("cancel_requested"):
                 raise RuntimeError("用户取消任务")
             shot = prepare_shot(original, project)
-            continuity = _continuity_policy(project, original, index)
-            if index > 0:
+            source_items = source_run.get("results", []) if source_run else []
+            source_index = next((i for i, item in enumerate(source_items)
+                                 if item.get("shot_id") == original["id"]), -1)
+            preceding_item = source_items[source_index - 1] if source_index > 0 else None
+            preceding_original = (next((item for item in project["shots"]
+                                        if item["id"] == preceding_item.get("shot_id")), None)
+                                  if preceding_item else shots[index - 1] if index > 0 else None)
+            if source_run and preceding_item and preceding_original:
+                previous = OUTPUTS / preceding_item["file"]
+                previous_signature = preceding_item.get("signature")
+            continuity = _continuity_policy(project, original,
+                                            source_index if source_run else index)
+            fresh_composition = (bool(project.get("continuous_take", True)) and
+                                 _requests_fresh_composition(preceding_original, original))
+            if fresh_composition:
+                continuity = {"enabled": False, "frames": 0, "strength": "none"}
+                shot["transition_mode"] = "dissolve"
+            if preceding_original:
                 # Selected character references identify who continues across
                 # the segment boundary; shared references identify the same cast.
-                previous_identities = _shot_identity_refs(shots[index - 1], project, assets)
+                previous_identities = _shot_identity_refs(preceding_original, project, assets)
                 current_identities = _shot_identity_refs(original, project, assets)
                 shot["continuity_subject_relation"] = _continuity_subject_relation(
                     previous_identities, current_identities)
@@ -1270,7 +1923,7 @@ def run_project(run_id: str) -> None:
                         continuity = {"enabled": False, "frames": 0, "strength": "none"}
                     elif continuity.get("enabled") and continuity.get("strength") == "strong":
                         continuity["frames"] = NEW_IDENTITY_CONTEXT_FRAMES
-            shot["continuous_take"] = bool(project.get("continuous_take", True))
+            shot["continuous_take"] = bool(project.get("continuous_take", True)) and not fresh_composition
             shot["continuity"] = continuity["enabled"]
             shot["continuity_frames"] = continuity["frames"]
             shot["continuity_strength"] = continuity["strength"]
@@ -1278,8 +1931,17 @@ def run_project(run_id: str) -> None:
             shot["continuity_frames"], shot["continuity_visible_frames"] = _handoff_window(
                 shot.get("continuity_subject_relation", "same") if continuity.get("enabled") else "none",
                 shot["continuity_frames"])
+            if shot["continuity_frames"] and _has_spoken_audio(original):
+                # Keep the drop-able head at one frame for narrated handoffs.
+                shot["continuity_frames"] = min(shot["continuity_frames"], NARRATED_HANDOFF_FRAMES)
+                shot["continuity_visible_frames"] = min(shot["continuity_visible_frames"],
+                                                       NARRATED_HANDOFF_VISIBLE, shot["continuity_frames"])
             if shot["continuity_frames"]:
                 shot["continuity_guide_frames"] = _continuity_anchor_frames(shot["continuity_frames"])
+                # Align the effective duration with the *length* contribution of the
+                # handoff window: build_h3_graph requests duration + continuity_frames.
+                shot["_h3_effective_duration"] = _grid_duration(
+                    float(shot.get("duration", 5)), shot["continuity_frames"])
             render_settings = project
             if project.get("memory_policy") == "auto_vram":
                 memory_plan = _auto_memory_plan(int(project.get("width", 1024)), int(project.get("height", 576)))
@@ -1301,11 +1963,18 @@ def run_project(run_id: str) -> None:
                 update_run(run_id, memory_plans=plans)
             signature = _shot_signature(shot, project, assets, previous_signature)
             cached = saved_results.get(shot["id"])
-            if cached and cached.get("signature") == signature and (OUTPUTS / cached.get("file", "")).is_file():
-                results.append(cached)
+            if (not run.get("reroll_shot_id") and cached and cached.get("signature") == signature
+                    and (OUTPUTS / cached.get("file", "")).is_file()):
+                # Refresh the length from the file so cached shots report what the
+                # film actually contains, not the authored duration.
+                cached_seconds = round(round(video_duration(OUTPUTS / cached["file"]) * 24) / 24, 3)
+                results.append({**cached, "effective_duration": cached_seconds,
+                                "planned_duration": cached.get("planned_duration") or cached_seconds})
                 previous = OUTPUTS / cached["file"]
                 previous_signature = signature
-                update_run(run_id, results=results, progress=f"{index + 1}/{len(shots)}", current=shot["name"] + " · 已复用缓存")
+                reused_shot_ids.append(shot["id"])
+                update_run(run_id, results=results, progress=f"{index + 1}/{len(shots)}",
+                           current=shot["name"] + " · 已复用缓存", reused_shot_ids=reused_shot_ids)
                 continue
             update_run(run_id, current=shot["name"] + " · 准备生成", progress=f"{index}/{len(shots)}")
             media = _make_media_map(shot, project, assets)
@@ -1347,11 +2016,11 @@ def run_project(run_id: str) -> None:
                 if read()["runs"][run_id].get("cancel_requested"):
                     raise RuntimeError("用户取消任务")
                 if shot.get("continuity_video"):
-                    _trim_prefix(first_pass, shot["continuity_frames"] / 24, float(shot["duration"]),
-                                 shot.get("continuity_visible_frames", 0))
+                    plan = _trim_downloaded_shot(first_pass, shot, previous)
+                    shot["_h3_trim_plan"] = plan
                     if pre_refine:
-                        _trim_prefix(pre_refine, shot["continuity_frames"] / 24, float(shot["duration"]),
-                                     shot.get("continuity_visible_frames", 0))
+                        _trim_downloaded_shot(pre_refine, shot, previous)
+                shot["_h3_entry_flash"] = _suppress_entry_flash(first_pass)
                 if project.get("face_refine"):
                     refined = output_dir / f"shot_{index:03d}_face.mp4"
                     face_python = os.environ.get("H3_STUDIO_FACE_PYTHON", "/home/administrator/ComfyUI/venv/bin/python")
@@ -1433,11 +2102,21 @@ def run_project(run_id: str) -> None:
             _audio_mode(final, source, shot.get("audio_mode", "generate"))
             previous = final
             previous_signature = signature
+            plan = shot.get("_h3_trim_plan") or {}
+            actual_seconds = round(video_duration(final) * 24) / 24
             results.append({"shot_id": shot["id"], "signature": signature, "file": str(final.relative_to(OUTPUTS)),
                             "h3_file": str(first_pass.relative_to(OUTPUTS)),
                             "pre_refine_file": str(pre_refine.relative_to(OUTPUTS)) if pre_refine else None,
+                            "transition_mode": shot.get("transition_mode", "continue"),
                             "handoff_visible_frames": shot.get("continuity_visible_frames", 0),
-                            "handoff_guide_frames": shot.get("continuity_guide_frames", 0)})
+                            "handoff_guide_frames": shot.get("continuity_guide_frames", 0),
+                            "effective_duration": round(actual_seconds, 3),
+                            "planned_duration": round(float(plan.get("output_frames") or round(
+                                float(shot.get("_h3_effective_duration") or shot["duration"]) * 24)) / 24, 3),
+                            "dropped_head_frames": plan.get("head_dropped_frames", 0),
+                            "head_speech_preserved": bool(plan.get("head_speech_preserved")),
+                            "head_peak_dbfs": plan.get("head_peak_dbfs"),
+                            "narration_mode": plan.get("mode")})
             update_run(run_id, results=results)
             update_run(run_id, progress=f"{index + 1}/{len(shots)}", current=shot["name"] + " · 已完成")
             under_pressure, vram_detail = _vram_is_under_pressure()
@@ -1473,53 +2152,58 @@ def run_project(run_id: str) -> None:
         # Strong continuous-take mode always needs a single deliverable. Keep
         # per-shot files as source segments, but do not let "segments" export
         # suppress the stitched long take.
-        if project.get("export_mode") == "all" or project.get("continuous_take", True):
+        if source_run:
+            replacement = next((item for item in results
+                                if item.get("shot_id") == run["reroll_shot_id"]), None)
+            if not replacement:
+                raise RuntimeError("重抽镜头没有生成结果")
+            combined = _reroll_result_list(source_run.get("results", []),
+                                           run["reroll_shot_id"], replacement)
+            merge_items: list[Path] = []
+            seams: list[dict] = []
+            shot_by_id = {shot["id"]: shot for shot in project["shots"]}
+            for item_index, item in enumerate(combined):
+                current_shot = shot_by_id.get(item.get("shot_id"), {})
+                previous_shot = shot_by_id.get(combined[item_index - 1].get("shot_id"), {}) if item_index else {}
+                _append_merge_item(merge_items, seams, OUTPUTS / item["file"], item,
+                                   item_index, output_dir, project,
+                                   preserve_spoken_audio=_preserve_spoken_seam(
+                                       previous_shot, current_shot,
+                                       int(item.get("handoff_visible_frames") or 0)))
+            if len(merge_items) > 1:
+                merged = output_dir / "merged.mp4"
+                _merge(merge_items, merged, int(project.get("width", 1024)),
+                       int(project.get("height", 576)))
+                update_run(run_id, merged=str(merged.relative_to(OUTPUTS)),
+                           merge_seam_algorithm="adaptive_structural_v5",
+                           merge_seam_adjustments=seams)
+            update_run(run_id, results=combined,
+                       reused_shot_ids=[item.get("shot_id") for item in combined
+                                        if item.get("shot_id") != run["reroll_shot_id"]])
+        elif project.get("export_mode") == "all" or project.get("continuous_take", True):
             selected_ids = set(run["shot_ids"])
-            current_by_shot = {item["shot_id"]: item for item in results}
             merge_items = []
             seam_adjustments = []
-            passthrough = []
-            omitted = []
-            merge_previous_signature = None
-
-            for index, shot in enumerate(project["shots"]):
-                item = current_by_shot.get(shot["id"])
-                if item:
-                    _append_merge_item(merge_items, seam_adjustments, OUTPUTS / item["file"],
-                                       item, index, output_dir, project)
-                    merge_previous_signature = item.get("signature")
-                    continue
-                signature = _shot_signature(shot, project, assets, merge_previous_signature)
-                candidate = saved_results.get(shot["id"])
-                if (shot["id"] not in selected_ids and candidate and candidate.get("signature") == signature
-                        and (OUTPUTS / candidate.get("file", "")).is_file()):
-                    _append_merge_item(merge_items, seam_adjustments, OUTPUTS / candidate["file"],
-                                       candidate, index, output_dir, project)
-                    merge_previous_signature = signature
-                    continue
-                if shot["id"] not in selected_ids and shot.get("source_video"):
-                    passthrough_file = output_dir / f"passthrough_{index:03d}.mp4"
-                    try:
-                        _source_passthrough(shot, assets, passthrough_file)
-                        merge_items.append(passthrough_file)
-                        passthrough.append(shot["id"])
-                        merge_previous_signature = signature
-                        continue
-                    except Exception:
-                        passthrough_file.unlink(missing_ok=True)
-                omitted.append(shot["id"])
-                merge_previous_signature = None
+            merge_previous_shot = None
+            for index, (shot, item) in enumerate(_selected_results_for_merge(
+                    project["shots"], selected_ids, results)):
+                _append_merge_item(merge_items, seam_adjustments, OUTPUTS / item["file"],
+                                   item, index, output_dir, project,
+                                   preserve_spoken_audio=_preserve_spoken_seam(
+                                       merge_previous_shot or {}, shot,
+                                       int(item.get("handoff_visible_frames") or 0)))
+                merge_previous_shot = shot
+            omitted = [shot["id"] for shot in project["shots"] if shot["id"] not in selected_ids]
             if merge_items:
                 merged = output_dir / "merged.mp4"
                 _merge(merge_items, merged,
                        int(project.get("width", 1024)), int(project.get("height", 576)))
                 update_run(run_id, merged=str(merged.relative_to(OUTPUTS)),
-                           merge_seam_algorithm="adaptive_structural_v5", merge_seam_adjustments=seam_adjustments,
-                           source_passthrough_shots=passthrough, omitted_shots=omitted)
-            elif passthrough or omitted:
-                update_run(run_id, source_passthrough_shots=passthrough, omitted_shots=omitted)
+                           merge_seam_algorithm="adaptive_structural_v6_continuous_audio", merge_seam_adjustments=seam_adjustments,
+                           omitted_shots=omitted)
         update_run(run_id, status="completed", current="", finished_at=time.time(),
-                   active_stage="", active_shot_id="", active_prefix="")
+                   active_stage="", active_shot_id="", active_prefix="",
+                   reused_shot_ids=reused_shot_ids)
     except Exception as error:
         status = "cancelled" if str(error) == "用户取消任务" else "error"
         update_run(run_id, status=status, error=str(error), finished_at=time.time(), results=results)

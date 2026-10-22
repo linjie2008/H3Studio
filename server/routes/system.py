@@ -1,6 +1,12 @@
 """静态入口、健康检查、模型清单与存储状态。"""
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import time
+import urllib.request
+
 from server.router import Route
 
 from runner import COMFY_URL
@@ -8,6 +14,13 @@ from runner import api
 from server.config import COMFY_DIR
 from server.config import ROOT
 from store import storage_status
+
+
+SETTINGS_HUB_ASSETS = {
+    "/ui/settings-hub.js": "settings-hub.js",
+    "/ui/settings-hub.css": "settings-hub.css",
+    "/ui/help.js": "help.js",
+}
 
 def get_comfy_ws(req, path, parts, url):
     """原 app.py 分支：`path == "/comfy-ws"`。"""
@@ -21,9 +34,14 @@ def get_index(req, path, parts, url):
     return
 
 
+def get_settings_hub_asset(req, path, parts, url):
+    """Serve only the explicit static assets used by the legacy workbench."""
+    req.file(ROOT / "static" / "ui" / SETTINGS_HUB_ASSETS[path])
+
+
 def get_api_version(req, path, parts, url):
     """原 app.py 分支：`path == "/api/version"`。"""
-    req.json(200, {"version": "independent-66"})
+    req.json(200, {"version": "independent-91"})
     return
 
 
@@ -49,6 +67,56 @@ def get_api_health(req, path, parts, url):
     except Exception as error:
         req.json(200, {"connected": False, "comfy_url": COMFY_URL, "error": str(error)})
     return
+
+
+def get_api_hardware(req, path, parts, url):
+    """Compact ComfyUI and host hardware snapshot for the workbench header."""
+    result = {"updated_at": time.time(), "comfy_connected": False, "gpus": []}
+    try:
+        with urllib.request.urlopen(COMFY_URL + "/system_stats", timeout=3) as response:
+            stats = json.load(response)
+        result["comfy_connected"] = True
+        result["ram_total"] = stats.get("system", {}).get("ram_total")
+        result["ram_free"] = stats.get("system", {}).get("ram_free")
+        result["comfy_devices"] = [{key: device.get(key) for key in
+                                    ("name", "index", "vram_total", "vram_free")}
+                                   for device in stats.get("devices", [])]
+    except Exception as error:
+        result["comfy_error"] = str(error)
+    try:
+        with urllib.request.urlopen(COMFY_URL + "/queue", timeout=3) as response:
+            queue = json.load(response)
+        result["queue_running"] = len(queue.get("queue_running", []))
+        result["queue_pending"] = len(queue.get("queue_pending", []))
+    except Exception:
+        pass
+    try:
+        query = "index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw"
+        probe = subprocess.run(["nvidia-smi", "--query-gpu=" + query,
+                                "--format=csv,noheader,nounits"], capture_output=True,
+                               text=True, timeout=3, check=True)
+        for row in probe.stdout.splitlines():
+            fields = [field.strip() for field in row.split(",")]
+            if len(fields) != 7:
+                continue
+            def number(value):
+                try:
+                    return float(value)
+                except ValueError:
+                    return None
+            result["gpus"].append({"index": int(fields[0]), "name": fields[1],
+                                   "utilization": number(fields[2]),
+                                   "memory_used_mib": number(fields[3]),
+                                   "memory_total_mib": number(fields[4]),
+                                   "temperature_c": number(fields[5]),
+                                   "power_w": number(fields[6])})
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    try:
+        result["load_1m"] = round(os.getloadavg()[0], 2)
+    except OSError:
+        pass
+    req.json(200, result)
 
 
 def get_api_models(req, path, parts, url):
@@ -92,6 +160,9 @@ ROUTES = [
     Route('GET', 'get_index',
          lambda path, parts, url: (path in ("/", "/index.html")),
          get_index),
+    Route('GET', 'get_settings_hub_asset',
+         lambda path, parts, url: path in SETTINGS_HUB_ASSETS,
+         get_settings_hub_asset),
     Route('GET', 'get_api_version',
          lambda path, parts, url: (path == "/api/version"),
          get_api_version),
@@ -101,6 +172,9 @@ ROUTES = [
     Route('GET', 'get_api_health',
          lambda path, parts, url: (path == "/api/health"),
          get_api_health),
+    Route('GET', 'get_api_hardware',
+         lambda path, parts, url: (path == "/api/hardware"),
+         get_api_hardware),
     Route('GET', 'get_api_models',
          lambda path, parts, url: (path == "/api/models"),
          get_api_models),

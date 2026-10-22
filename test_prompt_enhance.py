@@ -8,6 +8,90 @@ from app import enhancement_references
 
 
 class PromptEnhancementTests(unittest.TestCase):
+    def test_voiceover_terminal_punctuation_does_not_create_duplicate(self):
+        source = '旁白“彪投股份，专业成就未来”'
+        body = '旁白（S1）以画外音形式说道：<d>[Chinese] 彪投股份，专业成就未来。</d>画面中无出镜人物。'
+        for punctuation in ('。', '.', '！', '？', '…', ''):
+            with self.subTest(punctuation=punctuation):
+                rewritten = body.replace('未来。', '未来' + punctuation)
+                self.assertEqual(prompt_tools._preserve_inline_spoken_text(source, rewritten), rewritten)
+                self.assertEqual(prompt_tools._preserve_inline_spoken_text(
+                    source, rewritten + '\n' + source), rewritten)
+
+    def test_existing_duplicate_voiceover_is_removed(self):
+        body = ('实拍质感，画面以 <Picture 1> 中的园区湖面为主体。'
+                '画外音旁白（S1）缓缓响起：<d>[Chinese] 我爱佟丽娅</d>，'
+                '画面中无人出现，无唇部动作，声音清晰平稳地铺满整段。')
+        duplicate = body + '\n旁白“我爱佟丽娅”'
+        self.assertEqual(prompt_tools._preserve_inline_spoken_text(duplicate, duplicate), body)
+        self.assertEqual(prompt_tools._preserve_inline_spoken_text(duplicate, body), body)
+
+    def test_distinct_standalone_voiceover_is_retained(self):
+        body = '<d>[Chinese] 我爱佟丽娅</d>\n旁白“下一句话”'
+        self.assertEqual(prompt_tools._preserve_inline_spoken_text(body, body), body)
+
+    def test_optimization_does_not_duplicate_tagged_voiceover(self):
+        source = '湖面上空缓慢推进。旁白“我爱佟丽娅”'
+        rewritten = '实拍质感，湖面上空缓慢推进。画外音旁白缓缓响起：<d>[Chinese] 我爱佟丽娅</d>。'
+        with patch.object(prompt_tools, 'load_skill_context', return_value='Skill rules'), \
+             patch.object(prompt_tools, '_deepseek_complete', return_value=rewritten):
+            result = prompt_tools.enhance(source, 't2v', output_language='zh')
+        self.assertEqual(result, rewritten)
+        self.assertEqual(result.count('我爱佟丽娅'), 1)
+
+    def test_voiceover_in_visual_text_does_not_count_as_spoken(self):
+        result = prompt_tools._preserve_inline_spoken_text(
+            '旁白“我爱佟丽娅”', '湖边的招牌写着我爱佟丽娅。')
+        self.assertIn('旁白“我爱佟丽娅”', result)
+
+    def test_global_optimization_preserves_authored_voiceover_and_reference(self):
+        source = '全片保持电影写实风格，参考 <Picture 2>。旁白“彪投股份，品质未来。”'
+        skill = {'name': 'H3', 'files': [{'name': 'SKILL.md', 'content': 'Keep a consistent visual tone.'}]}
+        with patch.object(prompt_tools, 'preview_skill', return_value=skill), \
+             patch.object(prompt_tools, '_deepseek_complete',
+                          return_value='全片保持统一的电影写实风格，参考 <Picture 2>。') as complete:
+            result = prompt_tools.enhance_global_prompt(source)
+        self.assertIn('旁白“彪投股份，品质未来。”', result)
+        self.assertIn('<Picture 2>', result)
+        self.assertIn('project-wide prompt', complete.call_args.args[0][0]['content'])
+        self.assertNotIn('5 seconds', complete.call_args.args[0][0]['content'])
+
+    def test_global_optimization_rejects_changed_reference_marker(self):
+        skill = {'name': 'H3', 'files': [{'name': 'SKILL.md', 'content': ''}]}
+        with patch.object(prompt_tools, 'preview_skill', return_value=skill), \
+             patch.object(prompt_tools, '_deepseek_complete',
+                          return_value='全片参考 <Picture 3>。'):
+            with self.assertRaisesRegex(RuntimeError, '参考素材标记'):
+                prompt_tools.enhance_global_prompt('全片参考 <Picture 2>。')
+
+    def test_single_optimization_keeps_authored_voiceover_when_model_omits_it(self):
+        source = '镜头缓慢推进。旁白“彪投股份，以前瞻视野，构筑未来。”'
+        with patch.object(prompt_tools, 'load_skill_context', return_value='Skill rules'), \
+             patch.object(prompt_tools, '_deepseek_complete',
+                          return_value='镜头缓慢推进，呈现园区全景。'):
+            result = prompt_tools.enhance(source, 't2v', output_language='zh')
+        self.assertIn('旁白“彪投股份，以前瞻视野，构筑未来。”', result)
+        self.assertEqual(result.count('彪投股份'), 1)
+
+    def test_sequence_optimization_keeps_each_shots_own_voiceover(self):
+        shots = [
+            {'id': 'first', 'prompt': '园区全景。旁白“生态与办公在此交汇。”',
+             'mode': 't2v', 'duration': 5, 'output_language': 'zh'},
+            {'id': 'second', 'prompt': '镜头移向主楼。旁白：未来，从这里开始。',
+             'mode': 't2v', 'duration': 5, 'output_language': 'zh'},
+        ]
+        output = json.dumps({'prompts': [
+            {'id': 'first', 'prompt': '航拍园区全景。'},
+            {'id': 'second', 'prompt': '镜头平稳移向主楼。'},
+        ]}, ensure_ascii=False)
+        with patch.object(prompt_tools, 'load_skill_context', return_value='Skill rules'), \
+             patch.object(prompt_tools, '_deepseek_complete', return_value=output):
+            results = prompt_tools.enhance_sequence(shots)
+        self.assertIn('旁白“生态与办公在此交汇。”', results[0])
+        self.assertNotIn('未来，从这里开始', results[0])
+        self.assertIn('旁白：未来，从这里开始。', results[1])
+        self.assertNotIn('生态与办公', results[1])
+
     def test_fl2v_context_ignores_stale_gallery_references(self):
         project = {"id": "p", "reference_image_numbers": {
             "first": 1, "last": 2, "stale3": 3, "stale4": 4}}
@@ -296,3 +380,20 @@ class PromptEnhancementTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class StripShotMarkersTests(unittest.TestCase):
+    def test_nested_shot_markers_are_removed_before_compiling(self):
+        from engine import compile_shot_prompt
+        shot = {"mode": "t2v", "duration": 8, "speaker_id": "S1",
+                "prompt": "[Shot 1] 园区铭牌特写。[Shot 2] 在 00:02.500 处，镜头切至广角。"}
+        compiled = compile_shot_prompt(shot)
+        self.assertEqual(compiled.count("[Shot "), 1)
+        self.assertIn("[Shot 1] [0s-8s] 园区铭牌特写。", compiled)
+        self.assertIn("在 00:02.500 处", compiled)
+
+    def test_shot_markers_and_cjk_variants_are_stripped(self):
+        from engine import strip_shot_markers
+        self.assertEqual(strip_shot_markers("[Shot 2] 继续前行。"), "继续前行。")
+        self.assertEqual(strip_shot_markers("【镜头 3】继续前行。"), "继续前行。")
+        self.assertEqual(strip_shot_markers("0-2.5秒 推进。"), "0-2.5秒 推进。")

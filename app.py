@@ -15,6 +15,7 @@ import re
 import select
 import socket
 import ssl
+import struct
 import subprocess
 import threading
 import time
@@ -57,6 +58,33 @@ from server.support import (assets_with_character_names, deepseek_connection_sta
                             delete_projects, enhancement_references,
                             generate_multiview_batch, make_multiview_job,
                             parse_byte_range, _with_completion_status)
+
+# ComfyUI 的实时预览有开关：只有客户端在 WebSocket 首条消息里声明
+# supports_preview_metadata，comfy_execution/progress.py 才会把采样预览帧推给该连接。
+# 官方前端会发这条协商消息，本工作台的代理原本只转发 HTTP 升级，导致
+# sockets_metadata 里没有该特性，采样全程一帧都收不到（表现就是预览停在第一帧）。
+COMFY_CLIENT_FEATURE_FLAGS = {
+    "type": "feature_flags",
+    "data": {"supports_preview_metadata": True},
+}
+
+
+def _ws_masked_text_frame(payload: str) -> bytes:
+    """构造客户端→服务端的 WebSocket 文本帧（RFC 6455：客户端帧必须掩码）。"""
+    data = payload.encode("utf-8")
+    frame = bytearray([0x81])  # FIN + 文本帧 opcode
+    if len(data) < 126:
+        frame.append(0x80 | len(data))  # MASK 位 + 长度
+    elif len(data) < 65536:
+        frame.append(0x80 | 126)
+        frame += struct.pack(">H", len(data))
+    else:
+        frame.append(0x80 | 127)
+        frame += struct.pack(">Q", len(data))
+    mask = os.urandom(4)
+    frame += mask
+    frame += bytes(byte ^ mask[index % 4] for index, byte in enumerate(data))
+    return bytes(frame)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -104,6 +132,9 @@ class Handler(BaseHTTPRequestHandler):
                 f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
             ).encode("ascii"))
             upgraded = True
+            # 先于任何浏览器消息完成特性协商：ComfyUI 只认客户端的第一条消息，
+            # 声明后采样预览帧才会推到这个 sid。
+            upstream.sendall(_ws_masked_text_frame(json.dumps(COMFY_CLIENT_FEATURE_FLAGS)))
             upstream_extra = response[header_end + 4:]
             if upstream_extra:
                 self.connection.sendall(upstream_extra)
@@ -126,6 +157,15 @@ class Handler(BaseHTTPRequestHandler):
                     pass
         finally:
             if upstream:
+                try:
+                    # A WebSocket close frame lets ComfyUI stop its live-preview
+                    # encoder; a bare TCP close made it log "Broken pipe" errors.
+                    payload = b"\x03\xe8"
+                    mask = os.urandom(4)
+                    masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+                    upstream.sendall(bytes([0x88, 0x80 | len(payload)]) + mask + masked)
+                except OSError:
+                    pass
                 upstream.close()
 
     def json(self, status: int, data) -> None:
@@ -218,6 +258,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.dispatch("PUT")
         except (ValueError, KeyError, TypeError) as error:
+            # 保存失败的原因必须留痕：前端只弹一个 toast，日志里没有就查不出来。
+            self.log_error("PUT %s rejected: %s: %s",
+                           urllib.parse.urlsplit(self.path).path, type(error).__name__, error)
             self.json(400, {"error": str(error)})
 
     def do_DELETE(self) -> None:

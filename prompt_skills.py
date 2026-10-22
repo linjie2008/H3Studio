@@ -73,9 +73,15 @@ def _describe(skill_id: str, folder: Path, builtin: bool) -> dict:
                         name = match.group(1).strip().strip("\"'")
                     else:
                         description = match.group(1).strip().strip("\"'")
+    if builtin:
+        source, source_label = "official", "官方（MiniMax 指南）"
+    elif skill_id.startswith("aicg3d:"):
+        source, source_label = "AICG3D", "AICG3D 社区库"
+    else:
+        source, source_label = "custom", "自定义导入"
     return {"id": skill_id, "name": name, "description": description,
             "builtin": builtin, "protected": builtin or skill_id.startswith("aicg3d:"),
-            "source": "AICG3D" if skill_id.startswith("aicg3d:") else "本地",
+            "source": source, "source_label": source_label, "official": builtin,
             "path": str(folder)}
 
 
@@ -120,7 +126,9 @@ def load_skill_context(skill_id: str | None, mode: str, *, single_shot: bool = F
     files: list[tuple[str, Path]] = [("Official MiniMax H3 skill", h3_folder / "SKILL.md"),
                                     ("Active mode rules", h3_folder / "mode-guides" / f"{mode}.md")]
     if folder != h3_folder:
-        files.append(("Selected creative skill", folder / "SKILL.md"))
+        files.append(("Selected creative skill — apply its directing, staging, tone, camera vocabulary, "
+                      "pacing and continuity rules inside the official H3 format; its output-format or "
+                      "field-assembly rules are superseded by the application", folder / "SKILL.md"))
         if selected.startswith("aicg3d:"):
             # AICG3D's director package contains hundreds of KB of optional
             # references. Send only its compact entry point to the AI model.
@@ -179,7 +187,20 @@ def preview_skill(skill_id: str) -> dict:
         files.extend(sorted(path for path in folder.rglob("*")
                             if path.is_file() and path.suffix.lower() in TEXT_SUFFIXES
                             and path.name.lower() != "skill.md"))
-    entries, total = [], 0
+    def role_for(relative: str, builtin: bool) -> tuple[str, bool]:
+        """(role label, is_official_rules) for one previewed file."""
+        if not builtin:
+            return "Skill 正文" if relative.lower() == "skill.md" else "Skill 参考资料", False
+        if relative == "references/base-en.txt":
+            return "官方规则 · 基础模式 T2VA/I2VA/FL2VA/L2VA", True
+        if relative == "references/ref-en.txt":
+            return "官方规则 · 全参考模式 Ref2VA", True
+        if relative.startswith("mode-guides/"):
+            return "工作台模式要点", False
+        return "包装层（官方规则摘要 + 工作台用法）", False
+
+    builtin = skill_id == DEFAULT_SKILL
+    entries, total, official_sources = [], 0, []
     for path in files:
         resolved = path.resolve()
         if not resolved.is_relative_to(folder) or not resolved.is_file():
@@ -188,10 +209,18 @@ def preview_skill(skill_id: str) -> dict:
         total += len(content.encode("utf-8"))
         if total > MAX_SKILL_BYTES:
             raise ValueError("Skill 预览内容超过 256 KB")
-        entries.append({"name": path.relative_to(folder).as_posix(), "content": content})
+        relative = path.relative_to(folder).as_posix()
+        role, official_rules = role_for(relative, builtin)
+        if official_rules:
+            official_sources.append(relative)
+        entries.append({"name": relative, "content": content, "role": role,
+                        "official_rules": official_rules})
     if not entries:
         raise ValueError("Skill 没有可预览的文字内容")
-    return {"id": skill_id, "name": _describe(skill_id, folder, skill_id == DEFAULT_SKILL)["name"],
+    described = _describe(skill_id, folder, builtin)
+    return {"id": skill_id, "name": described["name"],
+            "source": described["source"], "source_label": described["source_label"],
+            "official": described["official"], "official_sources": official_sources,
             "files": entries}
 
 

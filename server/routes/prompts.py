@@ -4,14 +4,17 @@ from __future__ import annotations
 from server.router import Route
 
 from engine import compile_shot_prompt
+from engine import generation_prompt
 from engine import lint_shot_prompt
 from image_prompt_tools import optimize_image_prompt
 from prompt_skills import DEFAULT_SKILL
 from prompt_skills import list_skills
 from prompt_tools import enhance
+from prompt_tools import enhance_global_prompt
 from prompt_tools import enhance_sequence
 from prompt_tools import storyboard as generate_storyboard
 from runner import _shot_identity_refs
+from runner import continuity_preview
 from runner import prepare_shot
 from server.support import enhancement_references
 from store import read
@@ -92,11 +95,13 @@ def post_api_enhance(req, path, parts, url):
     state = read()
     project_id, shot_id = str(body.get("project_id") or ""), str(body.get("shot_id") or "")
     project_data = state["projects"].get(project_id) if project_id else None
-    skill_id = str(body.get("skill_id") or DEFAULT_SKILL)
+    requested_skill = str(body.get("skill_id") or "")
+    skill_id = requested_skill or DEFAULT_SKILL
     if project_id:
         if not project_data:
             raise ValueError("项目不存在，请刷新页面后重试")
-        skill_id = str(project_data.get("prompt_skill") or DEFAULT_SKILL)
+        if not requested_skill:
+            skill_id = str(project_data.get("prompt_skill") or DEFAULT_SKILL)
     skill_catalog = {item["id"]: item for item in list_skills()}
     if skill_id not in skill_catalog:
         skill_id = DEFAULT_SKILL
@@ -151,6 +156,26 @@ def post_api_enhance(req, path, parts, url):
     return
 
 
+def post_api_enhance_global(req, path, parts, url):
+    """Preview AI optimization of the current project's shared prompt."""
+    body = req.body_json()
+    project_id = str(body.get("project_id") or "")
+    project_data = read()["projects"].get(project_id)
+    if not project_data:
+        raise ValueError("项目不存在，请刷新页面后重试")
+    prompt = str(body.get("prompt") or "")
+    if prompt != str(project_data.get("shared_prompt") or ""):
+        raise ValueError("全片提示词已变化，请保存后重试优化")
+    skill_catalog = {item["id"]: item for item in list_skills()}
+    skill_id = str(project_data.get("prompt_skill") or DEFAULT_SKILL)
+    if skill_id not in skill_catalog:
+        skill_id = DEFAULT_SKILL
+    optimized = enhance_global_prompt(prompt, skill_id)
+    req.json(200, {"prompt": optimized, "skill_id": skill_id,
+                   "skill_name": skill_catalog[skill_id]["name"]})
+    return
+
+
 def post_api_storyboard(req, path, parts, url):
     """原 app.py 分支：`path == "/api/storyboard"`。"""
     body = req.body_json()
@@ -171,9 +196,11 @@ def post_api_prompt_preview(req, path, parts, url):
     if not shot:
         raise ValueError("镜头不存在")
     prepared = prepare_shot(shot, project)
-    prepared["continuous_take"] = bool(project.get("continuous_take", True))
-    prompt = compile_shot_prompt(prepared)
-    req.json(200, {"prompt": prompt, "findings": lint_shot_prompt(prepared),
+    # Compile the same continuity fields the run loop would apply, so the preview
+    # shows the continuation prelude and handoff wording that actually get sent.
+    prepared = continuity_preview(prepared, project, state.get("assets") or {})
+    prompt = generation_prompt(prepared)
+    req.json(200, {"prompt": prompt, "findings": lint_shot_prompt(prepared, project),
                     "image_references": prepared.get("_h3_image_reference_map", [])})
     return
 
@@ -194,4 +221,7 @@ ROUTES = [
     Route('POST', 'post_api_prompt_preview',
          lambda path, parts, url: (path == "/api/prompt-preview"),
          post_api_prompt_preview),
+    Route('POST', 'post_api_enhance_global',
+         lambda path, parts, url: (path == "/api/enhance-global"),
+         post_api_enhance_global),
 ]

@@ -201,7 +201,7 @@ const skillDescription = computed(() => {
 })
 
 function skillPrefix(skill) {
-  return skill.builtin ? '官方 · ' : skill.source === 'AICG3D' ? 'AICG3D · ' : ''
+  return skill.builtin ? '官方 · ' : skill.source === 'AICG3D' ? 'AICG3D 社区 · ' : '自定义 · '
 }
 
 async function onSkillChange(event) {

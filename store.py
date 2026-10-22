@@ -54,6 +54,8 @@ def _normalize(data: dict) -> dict:
         used = set()
         next_number = 1
         for character in project.get("characters", []):
+            if character.get("character_form") not in ("auto", "human", "animal", "anthropomorphic"):
+                character["character_form"] = "auto"
             if character.get("multiview_layout") not in ("four", "five", "six"):
                 character["multiview_layout"] = "four"
             if character.get("multiview_engine") not in ("xb_qwen", "krea2", "qwen_sheet"):
@@ -401,12 +403,13 @@ def new_shot() -> dict:
         "dialogue_carries_out": False,
         "overall_soundscape": "", "non_diegetic_music": "",
         "ref_image_roles": {}, "ref_video_roles": {}, "ref_audio_roles": {},
+        "replace_person": False, "swap_lora": "character", "faceswap_trigger_only": False,
     }
 
 
 def new_project(name: str) -> dict:
     return {
-        "id": uid(), "name": name.strip() or "未命名项目", "width": 1216, "height": 672,
+        "id": uid(), "name": name.strip() or "未命名项目", "marked": False, "width": 1216, "height": 672,
         "_data_version": 0,
         "memory_policy": "manual",
         "prompt_skill": "h3-prompt-writing",
