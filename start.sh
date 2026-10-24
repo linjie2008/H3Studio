@@ -57,7 +57,7 @@ if [[ -n "$studio_version" && "$studio_version" != *"independent-92"* ]]; then
 fi
 
 if ! ready "$studio_url/api/version"; then
-    echo "启动导演工作台…"
+    echo "启动 H3 Studio 导演台（端口 $studio_port）…"
     setsid env H3_STUDIO_HOST="$studio_host" "$agent_python" "$studio_dir/app.py" >"$studio_dir/logs/studio.log" 2>&1 </dev/null &
     disown -a 2>/dev/null || true
     for attempt in $(seq 1 20); do
@@ -65,12 +65,12 @@ if ! ready "$studio_url/api/version"; then
         sleep 1
     done
     if ! ready "$studio_url/api/version"; then
-        echo "导演工作台启动失败。查看 $studio_dir/logs/studio.log" >&2
+        echo "H3 Studio 导演台启动失败。查看 $studio_dir/logs/studio.log" >&2
         exit 1
     fi
 fi
 
-echo "导演工作台已就绪：$studio_url"
+echo "H3 Studio 导演台已就绪：$studio_url"
 if ready "$comfy_url/system_stats"; then
     echo "ComfyUI 推理服务已连接：$comfy_url"
     if ! curl -fsS --max-time 3 "$comfy_url/object_info/H3StudioContinueRemask" 2>/dev/null | grep -q 'H3StudioContinueRemask'; then

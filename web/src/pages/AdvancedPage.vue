@@ -12,7 +12,7 @@ const ui = useUiStore()
 
 const project = computed(() => projectStore.project)
 
-const catalog = ref({ semantic_adapters: [], latent_models: [] })
+const catalog = ref({ semantic_adapters: [] })
 onMounted(async () => {
   try { catalog.value = await request('/api/models') } catch { /* 目录不可用时保留空列表 */ }
 })
@@ -21,16 +21,20 @@ const adapterOptions = computed(() => [
   { value: '', label: '关闭' },
   ...(catalog.value.semantic_adapters || []).map(name => ({ value: name, label: name })),
 ])
-const latentModelOptions = computed(() => {
-  const models = catalog.value.latent_models || []
-  const current = project.value?.latent_model
-  const options = models.map(name => ({ value: name, label: name }))
-  if (current && !models.includes(current)) options.unshift({ value: current, label: current })
-  return options
+const sizePreset = computed(() => {
+  const w = Number(project.value?.output_width || 0)
+  const h = Number(project.value?.output_height || 0)
+  return w && h ? `${w}x${h}` : (w || h ? '' : '0x0')
 })
 
 function onField(event, key) {
   projectStore.set(key, coerceField(key, event.target.value, event.target))
+}
+
+function onSizePreset(event) {
+  const [w, h] = String(event.target.value || '0x0').split('x').map(item => Number(item) || 0)
+  projectStore.set('output_width', w)
+  projectStore.set('output_height', h)
 }
 </script>
 
@@ -66,57 +70,39 @@ function onField(event, key) {
               <option value="true">开启（减少模型缓存显存占用）</option>
             </select>
             <p class="hint">每个镜头结束后请求 ComfyUI 卸载缓存模型；后续镜头可能需要重新加载权重。</p></div>
-          <div class="field"><label>SelfLift 渐进一采</label>
-            <select :value="String(project.selflift)" @change="onField($event, 'selflift')">
-              <option value="false">关闭</option><option value="true">开启</option>
-            </select></div>
-          <div class="field"><label>SelfLift 低清比例</label>
-            <input type="number" min="0.25" max="1" step="0.05"
-              :value="project.selflift_scale" @input="onField($event, 'selflift_scale')"></div>
-          <div class="field"><label>SelfLift 高清步数</label>
-            <input type="number" min="1" max="7" step="1"
-              :value="project.selflift_highres_steps" @input="onField($event, 'selflift_highres_steps')"></div>
-          <div class="field"><label>SelfLift 像素锚混合 ρ</label>
-            <input type="number" min="0" max="1" step="0.05"
-              :value="project.selflift_rho" @input="onField($event, 'selflift_rho')"></div>
-          <div class="field"><label>SelfLift 高清阶段空间分块</label>
-            <select :value="String(project.selflift_tiling)" @change="onField($event, 'selflift_tiling')">
-              <option value="false">关闭</option><option value="true">开启</option>
-            </select></div>
-          <div class="field"><label>空间分块数量</label>
-            <input type="number" min="1" max="8" step="1"
-              :value="project.selflift_tile_count" @input="onField($event, 'selflift_tile_count')"></div>
-          <div class="field"><label>空间分块重叠像素</label>
-            <input type="number" min="0" max="2048" step="1"
-              :value="project.selflift_tile_overlap" @input="onField($event, 'selflift_tile_overlap')"></div>
-          <div class="field"><label>H3 3D latent 权重</label>
-            <select :value="project.latent_model" @change="onField($event, 'latent_model')">
-              <option v-for="opt in latentModelOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-            </select></div>
-          <div class="field"><label>H3 二采 / latent 放大</label>
-            <select :value="project.refine_mode" @change="onField($event, 'refine_mode')">
-              <option value="off">关闭</option>
-              <option value="same">原画布精修</option>
-              <option value="latent">3D latent 放大后精修</option>
-              <option value="latent_only">只做 3D latent 放大</option>
-            </select></div>
-          <div class="field"><label>二采步数</label>
-            <input type="number" min="1" max="16" step="1"
-              :value="project.refine_steps" @input="onField($event, 'refine_steps')"></div>
-          <div class="field"><label>二采轮数</label>
-            <input type="number" min="1" max="8" step="1"
-              :value="project.refine_passes" @input="onField($event, 'refine_passes')"></div>
-          <div class="field"><label>二采重绘幅度</label>
-            <input type="number" min="0.01" max="1" step="0.01"
-              :value="project.refine_denoise" @input="onField($event, 'refine_denoise')"></div>
-          <div class="field"><label>3D latent 目标画布</label>
-            <div class="row">
-              <input type="number" min="32" step="32" style="width:46%"
-                :value="project.refine_width" @input="onField($event, 'refine_width')">
-              <input type="number" min="32" step="32" style="width:46%"
-                :value="project.refine_height" @input="onField($event, 'refine_height')">
-            </div></div>
         </div>
+      </section>
+
+      <section class="panel settings-page" style="background:#fff;border-radius:14px;margin-top:16px">
+        <h3 style="margin-top:0">清晰度</h3>
+        <p class="hint">人物不清晰、AI 味重，先调这里。核心是三件事：画布用 H3 原生尺寸、二采用两阶段采样、成片尺寸单独指定。</p>
+        <div class="grid3">
+          <div class="field"><label>二采方式</label>
+            <select :value="project.refine_mode" @change="onField($event, 'refine_mode')">
+              <option value="off">关闭 · 只采样一次</option>
+              <option value="selflift">两阶段 SelfLift（推荐 · 清晰度来源）</option>
+            </select>
+            <p class="hint">两阶段 = 低清前缀 → H3 学习式 latent 放大 → 高清续采；音轨锁定首采，参考图引导随分辨率重建。</p></div>
+          <div class="field"><label>成片尺寸（宽 × 高）</label>
+            <div class="row">
+              <input type="number" min="0" step="2" style="width:46%"
+                :value="project.output_width" @input="onField($event, 'output_width')">
+              <input type="number" min="0" step="2" style="width:46%"
+                :value="project.output_height" @input="onField($event, 'output_height')">
+            </div>
+            <p class="hint">填 0 表示不重采样。H3 原生画布 1344×768（1.75:1），超分后是 1890×1080；填 1920×1080 会等比放大后<b>居中裁切</b>到正好这个尺寸（不拉伸、不加黑边）。</p></div>
+          <div class="field"><label>成片方向预设</label>
+            <select :value="sizePreset" @change="onSizePreset">
+              <option value="">自定义</option>
+              <option value="1920x1080">1920 × 1080 横屏</option>
+              <option value="1080x1920">1080 × 1920 竖屏</option>
+              <option value="2560x1440">2560 × 1440 横屏</option>
+              <option value="1440x2560">1440 × 2560 竖屏</option>
+              <option value="0x0">不重采样</option>
+            </select>
+            <p class="hint">方向要和项目画布一致，否则竖屏片会被裁成横屏。</p></div>
+        </div>
+        <p class="hint">画布请保持在 1344×768（横屏）或 768×1344（竖屏）附近：超出 H3 原生画布，模型会跑在分布之外，皮肤和织物发蜡发平，正是「AI 味重」的来源。需要更大分辨率就用超分补，不要把画布拉大。</p>
       </section>
     </div>
   </section>

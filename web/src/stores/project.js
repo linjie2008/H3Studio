@@ -15,6 +15,7 @@ export const useProjectStore = defineStore('project', {
     saveTimer: null,
     saveInFlight: null,
     saveRevision: 0,
+    baseSnapshot: null,
     loaded: false,
     loadError: '',
   }),
@@ -31,6 +32,7 @@ export const useProjectStore = defineStore('project', {
         }
         if (this.project) localStorage.setItem('h3studio.projectId', this.project.id)
         else localStorage.removeItem('h3studio.projectId')
+        this.baseSnapshot = this.project ? JSON.parse(JSON.stringify(this.project)) : null
         await this.loadAssets()
         this.loadError = ''
       } catch (e) {
@@ -75,6 +77,7 @@ export const useProjectStore = defineStore('project', {
 
     select(projectId) {
       this.project = this.projects.find(p => p.id === projectId) || null
+      this.baseSnapshot = this.project ? JSON.parse(JSON.stringify(this.project)) : null
       if (this.project) localStorage.setItem('h3studio.projectId', this.project.id)
       else localStorage.removeItem('h3studio.projectId')
       this.loadAssets()
@@ -121,6 +124,7 @@ export const useProjectStore = defineStore('project', {
               JSON.stringify(this.project) === signature
             if (unchanged) {
               this.project = saved
+              this.baseSnapshot = JSON.parse(JSON.stringify(saved))
               this.saveState = '已保存'
             } else {
               // 保存期间用户又改了：只吸收服务端版本号，再排一次保存。
@@ -133,6 +137,43 @@ export const useProjectStore = defineStore('project', {
           }
           return true
         } catch (e) {
+          // 乐观锁冲突：项目在别处（另一个窗口 / 智能体 / 素材变动）被改过。
+          // 必须把本地改过的字段合并回最新版本再存一次，否则「把速度改成
+          // Turbo 8 步」这类改动会被静默丢掉，表现为「选了 8 步却跑 4 步」。
+          if (/其他页面更新|版本无效/.test(e.message)) {
+            try {
+              const latest = await request('/api/projects/' + projectId)
+              const merged = JSON.parse(JSON.stringify(latest))
+              const base = this.baseSnapshot || snapshot
+              const changed = (value, baseValue) =>
+                JSON.stringify(value) !== JSON.stringify(baseValue)
+              const skip = new Set(['id', 'shots', 'next_subject_number', '_data_version'])
+              for (const key of Object.keys(this.project || {})) {
+                if (key.startsWith('_') || skip.has(key)) continue
+                if (changed(this.project[key], base[key])) merged[key] = this.project[key]
+              }
+              for (const shot of (this.project?.shots || [])) {
+                const target = (merged.shots || []).find(item => item.id === shot.id)
+                const baseShot = (base.shots || []).find(item => item.id === shot.id)
+                if (!target || !baseShot) continue
+                for (const key of Object.keys(shot)) {
+                  if (key.startsWith('_') || key === 'id') continue
+                  if (changed(shot[key], baseShot[key])) target[key] = shot[key]
+                }
+              }
+              const saved = await request('/api/projects/' + projectId, 'PUT', merged)
+              this.projects = this.projects.map(p => p.id === projectId ? saved : p)
+              if (this.project?.id === projectId) this.project = saved
+              this.baseSnapshot = JSON.parse(JSON.stringify(saved))
+              this.saveState = '已保存'
+              this.saveError = ''
+              return true
+            } catch (second) {
+              this.saveState = '保存失败'
+              this.saveError = second.message
+              return false
+            }
+          }
           this.saveState = '保存失败'
           this.saveError = e.message
           return false

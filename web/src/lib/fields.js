@@ -37,6 +37,7 @@ const NUMBER_KEYS = new Set([
   'semantic_alpha', 'selflift_scale', 'selflift_highres_steps', 'selflift_rho',
   'selflift_tile_count', 'selflift_tile_overlap', 'refine_steps', 'refine_passes',
   'refine_denoise', 'refine_width', 'refine_height', 'seam_prefix_frames',
+  'output_width', 'output_height',
   'seam_motion_frames',
 ])
 const BOOL_KEYS = new Set([

@@ -73,6 +73,17 @@ def get_api_hardware(req, path, parts, url):
     """Compact ComfyUI and host hardware snapshot for the workbench header."""
     result = {"updated_at": time.time(), "comfy_connected": False, "gpus": []}
     try:
+        memory = {}
+        with open("/proc/meminfo", encoding="ascii") as source:
+            for line in source:
+                key, _, value = line.partition(":")
+                if key in ("MemTotal", "MemAvailable"):
+                    memory[key] = int(value.strip().split()[0]) * 1024
+        result["wsl_ram_total"] = memory["MemTotal"]
+        result["wsl_ram_available"] = memory["MemAvailable"]
+    except (OSError, KeyError, ValueError, IndexError):
+        pass
+    try:
         with urllib.request.urlopen(COMFY_URL + "/system_stats", timeout=3) as response:
             stats = json.load(response)
         result["comfy_connected"] = True

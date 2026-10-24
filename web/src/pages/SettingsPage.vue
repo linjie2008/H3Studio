@@ -278,12 +278,12 @@ const skillSettingsProposal = ref(null) // {summary, changes, settings, projectI
 const suggesting = ref(false)
 
 function parameterValueLabel(key, value) {
-  if (key === 'generation_speed') return value === 'turbo4' ? '极速 · 4 步' : value === 'turbo' ? 'Turbo · 8 步'
+  if (key === 'generation_speed') return value === 'turbo4' ? '极速 · 4 步（4 步 LoRA）' : value === 'turbo' ? 'Turbo · 8 步（8 步 LoRA）'
     : value === 'smart' ? '智能均衡 · 按模式' : value === 'goldfish' ? '金鱼高清·本机版' : '标准 · 20 步'
   if (key === 'sage_attention' || key === 'upscale' || key === 'confirm_upscale') return value ? '开启' : '关闭'
   if (key === 'width' || key === 'height') return `${value}px`
   if (key === 'memory_policy') return value === 'auto_vram' ? '自动显存优化' : '手动'
-  if (key === 'refine_mode') return ({ off: '关闭', same: '同分辨率二采', latent: 'Latent 放大', latent_only: '仅 Latent 放大' })[value] || value
+  if (key === 'refine_mode') return ({ off: '关闭', selflift: '两阶段 SelfLift' })[value] || value
   if (key === 'continuity_frames') return `${value} 帧`
   if (key === 'refine_steps') return `${value} 步`
   if (key?.startsWith('upscale_')) return `${value}p`
@@ -595,8 +595,9 @@ onMounted(async () => { await skills.refresh() })
           <div class="field"><label>人脸细节增强</label>
             <select :value="String(project.face_refine)" @change="onField($event, 'face_refine')">
               <option value="false">关闭</option>
-              <option value="true">开启（YOLO 检测）</option>
-            </select></div>
+              <option value="true">开启（多脸检测 + 局部超分）</option>
+            </select>
+            <p class="hint">可增强检测到的人脸纹理；原视频里五官位置已变形或脸只有十几像素时，无法还原正确五官。</p></div>
         </div>
 
         <!-- 分段视频拼接 -->

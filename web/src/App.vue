@@ -125,7 +125,7 @@ onUnmounted(() => {
 <template>
   <div class="app-frame">
     <aside class="app-rail" aria-label="主导航">
-      <div class="rail-logo" title="漫剧工作台">H3</div>
+      <div class="rail-logo" title="H3 Studio · 导演台（8765）">H3</div>
       <button
         v-for="item in railItems" :key="item.workspace" type="button"
         :class="{ active: activeWorkspace === item.workspace }"
@@ -136,8 +136,8 @@ onUnmounted(() => {
     <main class="app-shell">
       <header class="app-head">
         <div class="brand">
-          <div class="sub">MINIMAX H3 · DIRECTOR STUDIO</div>
-          <h1>漫剧工作台</h1>
+          <div class="sub">MINIMAX H3 · DIRECTOR STUDIO · 8765</div>
+          <h1>H3 Studio · 导演台</h1>
         </div>
         <div class="project-tools">
           <span class="header-label">项目</span>

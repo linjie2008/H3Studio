@@ -83,7 +83,7 @@
         ...root.querySelectorAll('.hint,.script-help,.wb-help'),
       ];
       for (const hint of hints) {
-        if (!hint.isConnected || hint.closest('button,summary,label,a') ||
+        if (!hint.isConnected || hint.closest('button,summary,label,a,.video-library-card') ||
             hint.querySelector('a,button,input,select,textarea,img,video') ||
             !hint.textContent.trim()) continue;
         const tip = document.createElement('button');

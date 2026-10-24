@@ -167,7 +167,7 @@
     if (f) cardCanvas.querySelector('.settings-card-body').append(f);
   }
   const cardProject = makeCard('工程设置与全片导出', '项目基础命名与多镜头导出方式。', '🎬', 'grid3');
-  for (const s of ['[data-project="name"]', '[data-project="continuous_render_mode"]', '[data-project="export_mode"]']) {
+  for (const s of ['[data-project="name"]', '[data-project="continuous_render_mode"]', '[data-project="export_mode"]', '[data-project-output-size]']) {
     const f = extractField(s);
     if (f) cardProject.querySelector('.settings-card-body').append(f);
   }
