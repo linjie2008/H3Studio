@@ -58,7 +58,7 @@ def _graph():
     builder.add_conditional_edges("plan", _after_plan,
                                   {"act": "act", "finalize": "finalize"})
     builder.add_conditional_edges("act", _after_act,
-                                  {"plan": "plan", "summarize": "summarize"})
+                                  {"plan": "plan", "summarize": "summarize", "finalize": "finalize"})
     builder.add_edge("summarize", "finalize")
     builder.add_edge("finalize", END)
     _GRAPH = builder.compile(checkpointer=CHECKPOINTER)
@@ -122,6 +122,15 @@ def _normalize(decision: dict) -> dict:
     if kind == "tools":
         calls = [item for item in (decision.get("calls") or [])
                  if isinstance(item, dict)][:6]
+        # Providers sometimes put a write call in a batch despite the read-only
+        # contract. Execute it through the normal single-tool path so it is
+        # audited (or interrupted for confirmation), never silently discarded.
+        for call in calls:
+            name = str(call.get("name") or "")
+            risk = (TOOLS.get(name) or {}).get("risk")
+            if risk and risk != "read":
+                return {"kind": "tool", "name": name,
+                        "args": call.get("args") if isinstance(call.get("args"), dict) else {}}
         return {"kind": "tools", "calls": calls}
     name = str(decision.get("name") or "")
     args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
@@ -135,6 +144,13 @@ def _normalize(decision: dict) -> dict:
 def _plan_node(state: CreativeState, runtime=None) -> dict:
     context = getattr(runtime, "context", None)
     run = state.get("run") or {}
+    if (not run.get("steps") and agent_loop._simple_prompt_edit(run)
+            and agent_loop._skill_optimization_request(run)):
+        # The selected shot and project Skill already identify the operation.
+        # Asking the planner first adds a cloud round trip without information.
+        return {"action": {"kind": "tool", "name": "rewrite_prompt",
+                           "args": {"shot_id": run["shot_id"],
+                                    "instruction": run["question"]}}}
     _emit(context, {"type": "thinking", "note": "正在思考下一步…"})
     last_error = ""
     decision = None
@@ -143,11 +159,12 @@ def _plan_node(state: CreativeState, runtime=None) -> dict:
             decision = agent_loop._decide(run, run.get("history") or [])
             break
         except agent_loop.DecisionError as error:
-            # 模型写出了内容但格式不对：那段文字就是结论，直接交付。
-            text = error.raw.strip()
-            if len(text) > 12:
+            # A provider may return internal DSML/tool-call text as content.
+            # Only actual prose is safe to show as an answer.
+            text = agent_loop._plain_answer(error.raw)
+            if text:
                 return {"action": {"kind": "final", "answer": text}}
-            last_error = str(error)
+            last_error = "模型返回了无法识别的工具调用格式"
         except Exception as error:
             last_error = str(error)
         _emit(context, {"type": "retry",
@@ -156,7 +173,20 @@ def _plan_node(state: CreativeState, runtime=None) -> dict:
         time.sleep(1.2 * (attempt + 1))
     if decision is None:
         return {"action": {"kind": "final",
-                           "answer": f"我这轮没能规划成功：{last_error}"}}
+                           "answer": f"这次没能完成：{last_error}。请查看下方执行流水确认已完成的操作，再重试。"}}
+    if (decision.get("type") == "final" and agent_loop._simple_prompt_edit(run)
+            and not run.get("prompt_fallback_attempted")
+            and not any((step.get("data") or {}).get("prompt_after") is not None
+                        for step in (run.get("steps") or []))
+            and not any(word in str(decision.get("answer") or "")
+                        for word in ("无法", "不能", "缺少", "未找到", "需要"))):
+        # The model sometimes declares success after changing only a setting.
+        # A prompt-edit request must actually write a prompt before finishing.
+        next_run = _copy_run(state)
+        next_run["prompt_fallback_attempted"] = True
+        return {"run": next_run, "action": {"kind": "tool", "name": "rewrite_prompt",
+                                          "args": {"shot_id": run["shot_id"],
+                                                   "instruction": run["question"]}}}
     return {"action": _normalize(decision)}
 
 
@@ -173,12 +203,20 @@ def _act_node(state: CreativeState, runtime=None) -> dict:
                             str(item.get("name") or "") for item in calls)})
         observations = agent_loop._execute_batch(run, calls)
         run.setdefault("observations", []).extend(observations)
+        for observation in observations:
+            _emit(context, {"type": "step", "step": observation})
         _mirror(run)
         return {"run": run}
 
     name = action.get("name") or ""
     args = action.get("args") if isinstance(action.get("args"), dict) else {}
     spec = TOOLS.get(name) or {}
+
+    if spec.get("risk") != "read" and agent_loop._read_only_request(run):
+        run["read_only_blocked"] = True
+        _emit(context, {"type": "thinking", "note": "本轮要求只读，已阻止修改并整理已查到的信息…"})
+        _mirror(run)
+        return {"run": run}
 
     if spec.get("risk") in (RISK_DESTRUCTIVE, RISK_GPU):
         # 人机确认：整张图在这里挂起，用户点确认后从原地继续。
@@ -190,6 +228,7 @@ def _act_node(state: CreativeState, runtime=None) -> dict:
                            "result": "用户拒绝了这次操作。请换一个方案，或询问用户希望怎么做。"}
             run.setdefault("steps", []).append(observation)
             run.setdefault("observations", []).append(observation)
+            _emit(context, {"type": "step", "step": observation})
             _mirror(run)
             return {"run": run}
         run["pending"] = None
@@ -198,6 +237,16 @@ def _act_node(state: CreativeState, runtime=None) -> dict:
                     "note": f"正在执行：{spec.get('summary') or name}"})
     observation = agent_loop._execute(run, name, args)
     run.setdefault("observations", []).append(observation)
+    _emit(context, {"type": "step", "step": observation})
+    if (name in ("write_prompt", "rewrite_prompt") and observation.get("ok")
+            and (observation.get("data") or {}).get("prompt_after") is not None
+            and agent_loop._simple_prompt_edit(run)):
+        run["answer"] = "已更新当前镜头的提示词，并保存到项目。改动内容见下方对比。"
+        run["prompt_edit_complete"] = True
+    if (name == "set_shared_prompt" and observation.get("ok")
+            and agent_loop._simple_shared_prompt_edit(run)):
+        run["answer"] = "已更新全片统一提示词，并保存到项目。改动内容见下方对比。"
+        run["prompt_edit_complete"] = True
     _mirror(run)
     return {"run": run}
 
@@ -214,11 +263,16 @@ def _summarize_node(state: CreativeState, runtime=None) -> dict:
             answer = str(decision.get("answer") or "").strip()
     except Exception:
         answer = ""
+    if run.get("read_only_blocked") and any(
+            phrase in answer for phrase in ("已修改", "已更新", "已写入", "已保存", "已提交")):
+        answer = "本轮按只读要求未修改项目；模型未能给出可信的只读结论。"
     if not answer:
-        answer = ("我已经做了 %d 步操作，但时间到了，先把已经查到的结论给你。"
+        answer = ("本轮按只读要求未修改项目；暂时无法形成可靠结论。" if run.get("read_only_blocked")
+                  else "我已经做了 %d 步操作，但时间到了，先把已经查到的结论给你。"
                   % len(run.get("steps") or []))
     run["answer"] = answer
-    run["status"] = "budget"
+    run["status"] = "done" if (run.get("read_batch_stalled") or run.get("read_only_blocked") or
+                               int(run.get("repeated_read_count") or 0) >= 2) else "budget"
     _mirror(run)
     return {"run": run}
 
@@ -247,6 +301,11 @@ def _after_plan(state: CreativeState) -> str:
 
 def _after_act(state: CreativeState) -> str:
     run = state.get("run") or {}
+    if run.get("prompt_edit_complete"):
+        return "finalize"
+    if (run.get("read_batch_stalled") or run.get("read_only_blocked") or
+            int(run.get("repeated_read_count") or 0) >= 2):
+        return "summarize"
     if _budget_left(run, int(state.get("extra_steps") or 0)):
         return "plan"
     return "summarize"

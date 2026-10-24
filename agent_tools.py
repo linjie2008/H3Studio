@@ -21,7 +21,7 @@ from pathlib import Path
 
 from agent_audit import MISSING, record_change
 from agent_audit import _Missing as _MissingType
-from engine import ALL_MODES, lint_shot_prompt
+from engine import ALL_MODES, _guard_refine_settings, lint_shot_prompt
 from prompt_skills import list_skills
 from runner import _shot_identity_refs, prepare_shot
 from server.support import enhancement_references
@@ -449,11 +449,10 @@ def _write_prompt(ctx: ToolContext, args: dict) -> dict:
 
 
 @tool("rewrite_prompt", RISK_WRITE,
-      "按你的要求，用工作台的 Skill 重写某个镜头的提示词（会走云端 AI 优化，可用换人专用 Skill）。",
+      "按你的要求，用当前项目选定的 Skill 重写镜头提示词（会走云端 AI 优化）。",
       {"shot_id": {"type": "string", "desc": "镜头 id；留空表示当前镜头"},
        "instruction": {"type": "string", "desc": "要怎么改，例如「强化服装与人物一致，不要自编场景」", "required": True},
-       "language": {"type": "string", "desc": "en 或 zh，默认沿用镜头设置"},
-       "skill_id": {"type": "string", "desc": "指定 Skill；留空用项目当前 Skill"}})
+       "language": {"type": "string", "desc": "en 或 zh，默认沿用镜头设置"}})
 def _rewrite_prompt(ctx: ToolContext, args: dict) -> dict:
     from prompt_tools import enhance
     state = ctx.state()
@@ -464,15 +463,11 @@ def _rewrite_prompt(ctx: ToolContext, args: dict) -> dict:
     if not instruction:
         raise ValueError("请说明要怎么改")
     catalog = {item["id"]: item for item in list_skills()}
-    skill_id = str(args.get("skill_id") or "").strip()
-    swap_skill = "custom-h3-character-swap" if "custom-h3-character-swap" in catalog else ""
-    if not skill_id:
-        # 换人镜头默认用换人专用 Skill：它管得住身份绑定句式和标签纪律。
-        swap_like = bool(shot.get("ref_images")) and str(shot.get("mode") or "") in {"r2v", "rv2v"}
-        skill_id = swap_skill if (swap_like and swap_skill) \
-            else str(project.get("prompt_skill") or (swap_skill or "h3-prompt-writing"))
+    # The project's selected Skill is authoritative. An agent-supplied skill_id
+    # or a reference-shot heuristic must not silently override that choice.
+    skill_id = str(project.get("prompt_skill") or "h3-prompt-writing")
     if skill_id not in catalog:
-        skill_id = swap_skill or next(iter(catalog), "h3-prompt-writing")
+        raise ValueError(f"当前项目选择的 Skill「{skill_id}」不存在，请先在项目设置中重新选择")
     language = str(args.get("language") or shot.get("prompt_language") or "en")
     if language not in {"en", "zh"}:
         language = "en"
@@ -497,7 +492,7 @@ def _rewrite_prompt(ctx: ToolContext, args: dict) -> dict:
 
 
 @tool("set_shot_params", RISK_WRITE,
-      "修改镜头参数：生成模式、时长、参考图尺寸策略、参考素材底色、种子、音频方式、提示词语言、运镜、情绪等。",
+      "修改镜头参数：生成模式、时长、H3 二采、SeedVR2 放大、参考图尺寸策略、种子、音频方式、提示词语言等。",
       {"shot_id": {"type": "string", "desc": "镜头 id；留空表示当前镜头"},
        "params": {"type": "object",
                   "desc": "要改的字段，例如 {\"ref_image_size\":\"max\",\"ref_background\":\"inherit\",\"mode\":\"rv2v\",\"duration\":6}",
@@ -515,7 +510,7 @@ def _set_shot_params(ctx: ToolContext, args: dict) -> dict:
                "overall_soundscape", "non_diegetic_music", "dialogue_voiceover", "identity_first",
                "name", "guide_mode", "dialogue_language", "dialogue_time", "dialogue_cutoff",
                "dialogue_delivery", "dialogue_carries_out", "speaker_description",
-               "character_ids", "entity_ids", "scene_id"}
+               "character_ids", "entity_ids", "scene_id", "refine_mode", "upscale"}
     changed: dict = {}
     before_values: dict = {}
 
@@ -549,6 +544,14 @@ def _set_shot_params(ctx: ToolContext, args: dict) -> dict:
                 if value not in {"en", "zh"}:
                     raise ValueError("提示词语言只能是 en 或 zh")
                 target["prompt_language"] = value
+            elif key == "refine_mode":
+                if value not in {"off", "selflift", "same", "latent", "latent_only"}:
+                    raise ValueError("二采模式只能是 off / selflift / same / latent / latent_only")
+                target[key] = value
+            elif key == "upscale":
+                if not isinstance(value, bool):
+                    raise ValueError("upscale 必须是 true 或 false")
+                target[key] = value
             elif key in SHOT_PARAM_CHOICES:
                 if str(value) not in SHOT_PARAM_CHOICES[key]:
                     raise ValueError(f"{key} 只能是 {'、'.join(SHOT_PARAM_CHOICES[key])}")
@@ -591,11 +594,13 @@ def _set_project_settings(ctx: ToolContext, args: dict) -> dict:
                "selflift_tile_overlap", "refine_steps", "refine_passes", "refine_denoise",
                "refine_width", "refine_height", "upscale_resolution", "upscale_max_resolution",
                "continuity_frames", "h3_lora_dmad_strength", "h3_lora_mystic_strength",
-               "h3_lora_character_swap_strength", "seam_prefix_frames", "seam_motion_frames"}
+               "h3_lora_character_swap_strength", "seam_prefix_frames", "seam_motion_frames",
+               "refine_transition_step", "refine_lowres_scale", "refine_rho",
+               "output_width", "output_height"}
     boolean = {"upscale", "confirm_upscale", "face_refine", "semantic_magnitude_match",
                "selflift", "selflift_tiling", "clear_vram_between_shots", "sage_attention",
                "continuous_take", "h3_lora_dmad", "h3_lora_mystic", "seam_exposure",
-               "identity_first_on_switch"}
+               "identity_first_on_switch", "refine_tiling"}
     text = {"generation_speed", "prompt_skill", "export_mode", "memory_policy", "h3_video_vae",
             "h3_clip_model", "latent_model", "semantic_adapter", "refine_mode", "seam_mode",
             "attention_mode", "continuous_render_mode", "sequence_brief", "script_text",
@@ -652,6 +657,21 @@ def _set_project_settings(ctx: ToolContext, args: dict) -> dict:
             elif key in boolean:
                 project[key] = bool(value)
             else:
+                if key == "refine_mode":
+                    allowed = {"off", "selflift", "same", "latent", "latent_only"}
+                    if str(value) not in allowed:
+                        raise ValueError("二采档位只能是 off / selflift / same / latent / latent_only")
+                if key in ("refine_steps", "refine_denoise", "refine_mode"):
+                    # 二采的危险组合在这里就拦下：denoise 拉高而步数不跟着加，
+                    # 模型会在几步之内把五官重画一遍，人脸直接熔化。
+                    steps = int(settings.get("refine_steps", project.get("refine_steps", 4)) or 4)
+                    denoise = float(settings.get("refine_denoise", project.get("refine_denoise", 0.3)) or 0.3)
+                    mode = str(settings.get("refine_mode", project.get("refine_mode", "off")) or "off")
+                    if mode in ("same", "latent", "latent_only"):
+                        try:
+                            _guard_refine_settings(steps, denoise)
+                        except ValueError as error:
+                            raise ValueError(str(error)) from error
                 if key in ("attention_mode", "continuous_render_mode"):
                     allowed = {"attention_mode": {"off", "sage", "veda"},
                                "continuous_render_mode": {"auto", "segmented"}}[key]

@@ -30,6 +30,8 @@ DEDICATED_TOOLS = {
     "voice_asset": "bind_asset",
     "generation_source": "bind_asset",
     "image_assets": "bind_asset",
+    # 首帧画面是素材绑定，走 bind_asset（会校验素材是否存在、是否与镜头模式匹配）
+    "first_image": "bind_asset",
 }
 
 # 界面上有、但它不是「内容字段」，由其它机制管（画布联动、模式联动等）。

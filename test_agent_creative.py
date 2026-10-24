@@ -58,7 +58,7 @@ class CreativeAgentTests(unittest.TestCase):
             result = agent_loop.run_agent({"message": "把这个镜头的提示词改一下",
                                           "project_id": "agent-project", "shot_id": "shot-one"})
             self.assertEqual(result["status"], "done")
-            self.assertEqual(result["answer"], "已改好")
+            self.assertIn("已更新当前镜头的提示词", result["answer"])
             shot = self.data["projects"]["agent-project"]["shots"][0]
             self.assertEqual(shot["prompt"], "新提示词内容")
             self.assertEqual(result["report"]["applied"], 2)
@@ -68,6 +68,70 @@ class CreativeAgentTests(unittest.TestCase):
             self.assertEqual(undone["undone"], 1)
             shot = self.data["projects"]["agent-project"]["shots"][0]
             self.assertEqual(shot["prompt"], "原始提示词")
+
+    def test_optimization_uses_project_skill_even_if_model_calls_write_prompt(self):
+        self.data["projects"]["agent-project"]["prompt_skill"] = "custom-continuous-close-pass"
+        decisions = [{"type": "tool", "name": "write_prompt",
+                      "args": {"shot_id": "shot-one", "prompt": "模型自己写的文本"}}]
+        read_patch, change_patch, audit_patch, decide_patch = self._patches(decisions)
+        with read_patch, change_patch, audit_patch, decide_patch, \
+                patch.object(agent_tools, "list_skills", return_value=[
+                    {"id": "custom-continuous-close-pass", "name": "连续驶近特写运镜"}]), \
+                patch("prompt_tools.enhance", return_value="遵循项目 Skill 的优化文本") as enhance:
+            result = agent_loop.run_agent({"message": "优化这个镜头的提示词，保持运动连续",
+                                           "project_id": "agent-project", "shot_id": "shot-one"})
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(result["report"]["steps"][0]["tool"], "rewrite_prompt")
+        self.assertEqual(result["report"]["steps"][0]["data"]["skill_id"], "custom-continuous-close-pass")
+        self.assertEqual(self.data["projects"]["agent-project"]["shots"][0]["prompt"],
+                         "遵循项目 Skill 的优化文本")
+        self.assertEqual(enhance.call_args.args[2], "custom-continuous-close-pass")
+
+    def test_current_shot_optimization_skips_planner_round_trip(self):
+        read_patch, change_patch, audit_patch, decide_patch = self._patches([])
+        with read_patch, change_patch, audit_patch, decide_patch as decide, \
+                patch("prompt_tools.enhance", return_value="优化后的提示词"):
+            result = agent_loop.run_agent({"message": "优化当前镜头提示词，保持动作连续",
+                                           "project_id": "agent-project", "shot_id": "shot-one"})
+        self.assertEqual(result["status"], "done")
+        self.assertEqual([step["tool"] for step in result["report"]["steps"]], ["rewrite_prompt"])
+        decide.assert_not_called()
+        self.assertEqual(self.data["projects"]["agent-project"]["shots"][0]["prompt"], "优化后的提示词")
+
+    def test_shared_prompt_edit_stops_without_touching_shot_prompts(self):
+        decisions = [
+            {"type": "tool", "name": "set_shared_prompt",
+             "args": {"prompt": "全片保持超现实主义风格", "reason": "统一风格"}},
+            {"type": "tool", "name": "write_prompt",
+             "args": {"shot_id": "shot-one", "prompt": "不应执行"}},
+        ]
+        read_patch, change_patch, audit_patch, decide_patch = self._patches(decisions)
+        with read_patch, change_patch, audit_patch, decide_patch as decide:
+            result = agent_loop.run_agent({"message": "全局统一提示词中的风格一定要是超现实主义",
+                                           "project_id": "agent-project", "shot_id": "shot-one"})
+        self.assertEqual(result["status"], "done")
+        self.assertEqual([step["tool"] for step in result["report"]["steps"]], ["set_shared_prompt"])
+        self.assertEqual(self.data["projects"]["agent-project"]["shots"][0]["prompt"], "原始提示词")
+        self.assertEqual(self.data["projects"]["agent-project"]["shared_prompt"], "全片保持超现实主义风格")
+        decide.assert_called_once()
+
+    def test_rewrite_does_not_override_project_skill_for_reference_shot(self):
+        project = self.data["projects"]["agent-project"]
+        project["prompt_skill"] = "custom-continuous-close-pass"
+        project["shots"][0].update(mode="r2v", ref_images=["image-one"])
+        ctx = agent_tools.ToolContext("agent-project", "shot-one")
+        with patch.object(agent_tools, "read", return_value=self.data), \
+                patch.object(agent_tools, "change", side_effect=self._change), \
+                patch.object(agent_tools, "list_skills", return_value=[
+                    {"id": "custom-continuous-close-pass", "name": "连续驶近特写运镜"},
+                    {"id": "custom-h3-character-swap", "name": "换人"}]), \
+                patch.object(agent_tools, "reference_context_for", return_value={}), \
+                patch("prompt_tools.enhance", return_value="项目 Skill 的结果") as enhance:
+            result = agent_tools._rewrite_prompt(ctx, {
+                "shot_id": "shot-one", "instruction": "按当前项目要求优化",
+                "skill_id": "custom-h3-character-swap"})
+        self.assertEqual(result["data"]["skill_id"], "custom-continuous-close-pass")
+        self.assertEqual(enhance.call_args.args[2], "custom-continuous-close-pass")
 
     def test_destructive_tool_pauses_until_confirmed(self):
         decisions = [
@@ -131,7 +195,7 @@ class CreativeAgentTests(unittest.TestCase):
         ]
         read_patch, change_patch, audit_patch, decide_patch = self._patches(decisions)
         with read_patch, change_patch, audit_patch, decide_patch:
-            result = agent_loop.run_agent({"message": "改提示词",
+            result = agent_loop.run_agent({"message": "改提示词和参数后再检查",
                                           "project_id": "agent-project", "shot_id": "shot-one"})
         steps = result["report"]["steps"]
         self.assertFalse(steps[2].get("cached"))
@@ -156,8 +220,35 @@ class CreativeAgentTests(unittest.TestCase):
         self.assertEqual(tools, ["list_shots", "list_assets", "list_characters"])
         self.assertTrue(all(step["ok"] for step in result["report"]["steps"]))
 
-    def test_write_tool_is_not_run_in_a_read_batch(self):
-        """批量里混进写工具时，写工具必须退回单条执行（确认与留痕都靠它）。"""
+    def test_batch_read_refreshes_after_write_but_stalls_when_unchanged(self):
+        read_patch, change_patch, audit_patch, _ = self._patches([])
+        run = {"project_id": "agent-project", "shot_id": "shot-one", "question": "检查并修改",
+               "steps": [], "signatures": [], "changes": []}
+        calls = [{"name": "get_shot", "args": {"shot_id": "shot-one"}}]
+        with read_patch, change_patch, audit_patch:
+            first = agent_loop._execute_batch(run, calls)
+            self.assertEqual(first[0]["data"]["shot"]["prompt"], "原始提示词")
+            self.assertEqual(agent_loop._execute_batch(run, calls), [])
+            self.assertTrue(run["read_batch_stalled"])
+            edited = agent_loop._execute(run, "write_prompt",
+                                         {"shot_id": "shot-one", "prompt": "改后文本"})
+            self.assertTrue(edited["ok"], edited)
+            refreshed = agent_loop._execute_batch(run, calls)
+        self.assertEqual(refreshed[0]["data"]["shot"]["prompt"], "改后文本")
+        self.assertEqual(len([step for step in run["steps"] if step["tool"] == "get_shot"]), 2)
+
+    def test_batch_respects_read_limits_with_duplicate_calls(self):
+        run = {"steps": [], "read_cache": {}, "project_id": "agent-project", "shot_id": "shot-one"}
+        calls = [{"name": "get_shot", "args": {"shot_id": f"shot-{index}"}} for index in range(6)]
+        with patch.object(agent_loop, "GLOBAL_READ_CAP", 2), \
+                patch.object(agent_loop, "_run_tool", return_value={"tool": "get_shot", "ok": True,
+                                                                   "result": "ok", "data": {}}) as execute:
+            result = agent_loop._execute_batch(run, calls)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(execute.call_count, 2)
+
+    def test_write_tool_in_batch_uses_audited_single_path(self):
+        """批量里混进写工具时，转成单条执行并留下可回滚记录。"""
         decisions = [
             {"type": "tools", "calls": [
                 {"name": "list_shots", "args": {}},
@@ -170,8 +261,9 @@ class CreativeAgentTests(unittest.TestCase):
             result = agent_loop.run_agent({"message": "批量里带个写入",
                                           "project_id": "agent-project", "shot_id": "shot-one"})
         tools = [step["tool"] for step in result["report"]["steps"]]
-        self.assertNotIn("write_prompt", tools)
-        self.assertEqual(self.data["projects"]["agent-project"]["shots"][0]["prompt"], "原始提示词")
+        self.assertEqual(tools, ["write_prompt"])
+        self.assertEqual(result["report"]["changes"], 1)
+        self.assertEqual(self.data["projects"]["agent-project"]["shots"][0]["prompt"], "批量里的写入")
 
     def test_model_failure_is_announced_before_retrying(self):
         """模型没接上话时要立刻出声，不然界面会像卡死。"""
@@ -220,11 +312,13 @@ class CreativeAgentTests(unittest.TestCase):
             calls["n"] += 1
             if force_final:
                 return {"type": "final", "answer": "收尾结论：镜头 3 缺少参考图。"}
-            return {"type": "tool", "name": "list_shots", "args": {}}
+            return {"type": "tool", "name": "list_shots" if calls["n"] == 1 else "list_assets",
+                    "args": {}}
 
         read_patch, change_patch, audit_patch, decide_patch = self._patches([])
         with read_patch, change_patch, audit_patch, decide_patch:
-            with patch.object(agent_loop, "_decide", side_effect=decide):
+            with patch.object(agent_loop, "_decide", side_effect=decide), \
+                 patch.object(agent_loop, "MAX_STEPS", 2):
                 result = agent_loop.run_agent({"message": "一直查",
                                               "project_id": "agent-project", "shot_id": ""})
         self.assertEqual(result["status"], "budget")
@@ -244,6 +338,110 @@ class CreativeAgentTests(unittest.TestCase):
         self.assertEqual(result["status"], "done")
         self.assertIn("缺少参考图标签", result["answer"])
 
+    def test_dsml_tool_array_is_executed_instead_of_shown_to_user(self):
+        raw = ('[{"name":"get_shot","args":{"shot_id":"shot-one"}},'
+               '{"name":"get_shot","args":{"shot_id":"shot-two"}}]'
+               '｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>')
+        first = agent_loop._parse_json(raw)
+        self.assertEqual(first["type"], "tools")
+        events = []
+        read_patch, change_patch, audit_patch, decide_patch = self._patches(
+            [first, {"type": "final", "answer": "已检查两个镜头。"}])
+        with read_patch, change_patch, audit_patch, decide_patch:
+            result = agent_loop.run_agent({"message": "检查两个镜头",
+                                           "project_id": "agent-project"}, emit=events.append)
+        self.assertEqual(result["answer"], "已检查两个镜头。")
+        self.assertEqual([step["tool"] for step in result["report"]["steps"]],
+                         ["get_shot", "get_shot"])
+        self.assertEqual(len([event for event in events if event.get("type") == "step"]), 2)
+
+    def test_repeated_read_batch_reports_progress_instead_of_spinning(self):
+        first = {"type": "tools", "calls": [{"name": "get_shot",
+                                               "args": {"shot_id": "shot-one"}}]}
+        read_patch, change_patch, audit_patch, decide_patch = self._patches(
+            [first, first, {"type": "final", "answer": "已检查。"}])
+        with read_patch, change_patch, audit_patch, decide_patch:
+            result = agent_loop.run_agent({"message": "检查镜头",
+                                           "project_id": "agent-project"})
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(len(result["report"]["steps"]), 1)
+        self.assertEqual(result["answer"], "已检查。")
+        self.assertNotIn("batch", [step["tool"] for step in result["report"]["steps"]])
+
+    def test_repeating_same_single_read_twice_finishes(self):
+        repeated = {"type": "tool", "name": "get_shot", "args": {"shot_id": "shot-one"}}
+        read_patch, change_patch, audit_patch, decide_patch = self._patches(
+            [repeated, repeated, repeated, {"type": "final", "answer": "已经核对。"}])
+        with read_patch, change_patch, audit_patch, decide_patch:
+            result = agent_loop.run_agent({"message": "核对镜头", "project_id": "agent-project"})
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(result["answer"], "已经核对。")
+        self.assertEqual(len(result["report"]["steps"]), 3)
+
+    def test_provider_function_arguments_are_normalized(self):
+        raw = '{"tool_calls":[{"function":{"name":"get_shot","arguments":"{\\"shot_id\\":\\"shot-one\\"}"}}]}'
+        decision = agent_loop._parse_json(raw)
+        self.assertEqual(decision, {"type": "tools", "calls": [
+            {"name": "get_shot", "args": {"shot_id": "shot-one"}}]})
+
+    def test_explicit_read_only_request_blocks_model_write(self):
+        decisions = [
+            {"type": "tool", "name": "write_prompt",
+             "args": {"shot_id": "shot-one", "prompt": "不应写入"}},
+            {"type": "final", "answer": "只读核对完成，未修改项目。"},
+        ]
+        read_patch, change_patch, audit_patch, decide_patch = self._patches(decisions)
+        with read_patch, change_patch, audit_patch, decide_patch:
+            result = agent_loop.run_agent({"message": "只读核对提示词，不要修改项目",
+                                           "project_id": "agent-project", "shot_id": "shot-one"})
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(result["report"]["changes"], 0)
+        self.assertEqual(self.data["projects"]["agent-project"]["shots"][0]["prompt"], "原始提示词")
+        self.assertFalse(agent_loop._simple_prompt_edit({"question": "只读核对提示词，不要修改",
+                                                         "shot_id": "shot-one"}))
+
+    def test_read_only_request_does_not_interrupt_for_delete(self):
+        decisions = [
+            {"type": "tool", "name": "delete_shot", "args": {"shot_id": "shot-one"}},
+            {"type": "final", "answer": "只读查看完成。"},
+        ]
+        read_patch, change_patch, audit_patch, decide_patch = self._patches(decisions)
+        with read_patch, change_patch, audit_patch, decide_patch:
+            result = agent_loop.run_agent({"message": "仅查看镜头，不要执行删除",
+                                           "project_id": "agent-project", "shot_id": "shot-one"})
+        self.assertEqual(result["status"], "done")
+        self.assertFalse(result.get("pending"))
+        self.assertEqual(len(self.data["projects"]["agent-project"]["shots"]), 2)
+
+    def test_get_shot_digest_keeps_prompt_and_bound_reference(self):
+        item = {"tool": "get_shot", "ok": True, "result": "镜头详情",
+                "data": {"shot": {"id": "shot-one", "prompt": "猫使用 <Picture 2>"},
+                         "bound_assets": [{"id": "cat-image", "picture": 2}]}}
+        digest = agent_loop._compact_observation(item)["data"]
+        self.assertIn("猫使用 <Picture 2>", digest)
+        self.assertIn("cat-image", digest)
+
+    def test_prompt_edit_cannot_report_success_without_writing(self):
+        from agent_graph import _plan_node
+        run = {"question": "你来更新提示词", "shot_id": "shot-one", "steps": []}
+        with patch.object(agent_loop, "_decide", return_value={"type": "final", "answer": "已处理"}):
+            planned = _plan_node({"run": run})
+        self.assertEqual(planned["action"]["name"], "rewrite_prompt")
+        self.assertEqual(planned["action"]["args"]["shot_id"], "shot-one")
+        self.assertTrue(planned["run"]["prompt_fallback_attempted"])
+
+    def test_unrecognized_internal_markup_is_not_delivered_as_answer(self):
+        raw = '<｜DSML｜tool_calls>get_shot</｜DSML｜tool_calls>'
+        self.assertEqual(agent_loop._plain_answer(raw), "")
+        read_patch, change_patch, audit_patch, decide_patch = self._patches([])
+        with read_patch, change_patch, audit_patch, decide_patch:
+            with patch.object(agent_loop, "_decide", side_effect=agent_loop.DecisionError(
+                    "模型没有返回可解析的 JSON", raw)), patch("agent_graph.time.sleep"):
+                result = agent_loop.run_agent({"message": "检查镜头",
+                                               "project_id": "agent-project"})
+        self.assertNotIn("DSML", result["answer"])
+        self.assertIn("无法识别", result["answer"])
+
     def test_repeated_prompt_rewrites_show_one_diff(self):
         """同一镜头改写两次，报告里只应该有一条「改前/改后」对比。"""
         decisions = [
@@ -251,16 +449,20 @@ class CreativeAgentTests(unittest.TestCase):
              "args": {"shot_id": "shot-one", "prompt": "第一版"}},
             {"type": "tool", "name": "write_prompt",
              "args": {"shot_id": "shot-one", "prompt": "第二版"}},
+            {"type": "tool", "name": "write_prompt",
+             "args": {"shot_id": "shot-one", "prompt": "第三版"}},
             {"type": "final", "answer": "改好了"},
         ]
         read_patch, change_patch, audit_patch, decide_patch = self._patches(decisions)
         with read_patch, change_patch, audit_patch, decide_patch:
-            result = agent_loop.run_agent({"message": "改提示词",
+            result = agent_loop.run_agent({"message": "改提示词然后再次修改",
                                           "project_id": "agent-project", "shot_id": "shot-one"})
         diffs = result["report"]["prompt_changes"]
         self.assertEqual(len(diffs), 1)
         self.assertEqual(diffs[0]["before"], "原始提示词")
         self.assertEqual(diffs[0]["after"], "第二版")
+        self.assertFalse(result["report"]["steps"][2]["ok"])
+        self.assertIn("已改写两次", result["report"]["steps"][2]["result"])
 
     def test_run_history_lists_recent_runs(self):
         decisions = [{"type": "tool", "name": "list_shots", "args": {}},

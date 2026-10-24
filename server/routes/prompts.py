@@ -170,7 +170,12 @@ def post_api_enhance_global(req, path, parts, url):
     skill_id = str(project_data.get("prompt_skill") or DEFAULT_SKILL)
     if skill_id not in skill_catalog:
         skill_id = DEFAULT_SKILL
-    optimized = enhance_global_prompt(prompt, skill_id)
+    optimization_scope = str(body.get("optimization_scope") or "").strip()
+    if not optimization_scope:
+        raise ValueError("请先写明这次希望 AI 优化什么")
+    if len(optimization_scope) > 500:
+        raise ValueError("优化要求不能超过 500 字")
+    optimized = enhance_global_prompt(prompt, skill_id, optimization_scope)
     req.json(200, {"prompt": optimized, "skill_id": skill_id,
                    "skill_name": skill_catalog[skill_id]["name"]})
     return
