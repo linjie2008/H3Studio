@@ -36,24 +36,47 @@ class EngineAttentionTests(unittest.TestCase):
                 self.assertEqual(scheduler["inputs"]["steps"], 4)
 
     def test_reference_four_step_choice_is_not_overridden_for_person_replacement(self):
-        for dmad, expected in (
-            (False, "minimax_h3/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"),
-            (True, "minimax_h3/minimax_h3_dmad_full_dareties_v4_step600_comfy_fro.safetensors"),
-        ):
-            with self.subTest(dmad=dmad):
+        """The 4-step plan always samples with the family's distilled LoRA.
+
+        DMAD is a full-strength style LoRA, not a distilled four-step sampler:
+        running it as the sampler made swap shots land the wrong subject on
+        about half of the seeds, and stacking it on top of the distilled LoRA
+        exceeded this GPU's LoRA budget.  It therefore never replaces - and
+        never joins - the distilled sampler in the four-step plan.
+        """
+        distilled = "minimax_h3/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
+        dmad = "minimax_h3/minimax_h3_dmad_full_dareties_v4_step600_comfy_fro.safetensors"
+        for enabled in (False, True):
+            with self.subTest(h3_lora_dmad=enabled):
                 graph = build_h3_graph(
                     {"mode": "rv2v", "prompt": "Replace the person with the reference character.",
                      "duration": 4, "source_video": "source", "ref_images": ["person"],
                      "replace_person": True},
                     {"width": 480, "height": 864, "generation_speed": "turbo4",
-                     "h3_lora_dmad": dmad},
+                     "h3_lora_dmad": enabled},
                     {"source": "source.mp4", "person": "person.png"}, "replacement_speed_test",
                 )
                 loras = [node["inputs"]["lora_name"] for node in graph.values()
                          if node["class_type"] == "LoraLoaderModelOnly"]
                 scheduler = next(node for node in graph.values() if node["class_type"] == "BasicScheduler")
-                self.assertIn(expected, loras)
+                self.assertIn(distilled, loras)
+                self.assertNotIn(dmad, loras)
                 self.assertEqual(scheduler["inputs"]["steps"], 4)
+
+    def test_dmad_rides_along_in_the_twenty_step_quality_plan(self):
+        graph = build_h3_graph(
+            {"mode": "rv2v", "prompt": "Replace the person with the reference character.",
+             "duration": 4, "source_video": "source", "ref_images": ["person"],
+             "replace_person": True},
+            {"width": 480, "height": 864, "generation_speed": "quality",
+             "h3_lora_dmad": True, "h3_lora_dmad_strength": 0.6},
+            {"source": "source.mp4", "person": "person.png"}, "dmad_quality_test",
+        )
+        loras = [node["inputs"]["lora_name"] for node in graph.values()
+                 if node["class_type"] == "LoraLoaderModelOnly"]
+        scheduler = next(node for node in graph.values() if node["class_type"] == "BasicScheduler")
+        self.assertIn("minimax_h3/minimax_h3_dmad_full_dareties_v4_step600_comfy_fro.safetensors", loras)
+        self.assertEqual(scheduler["inputs"]["steps"], 20)
 
     def test_faceswap_variant_uses_author_lora_and_trigger(self):
         shot = {"mode": "rv2v", "prompt": "Replace the person with the reference character.",

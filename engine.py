@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+from pathlib import Path
 
 
 CREATIVE = {"t2v", "i2v", "fl2v"}
@@ -59,6 +60,46 @@ SMART_PRESETS = {
     "rv2v": (20, False),
 }
 
+# MiniMax H3 was trained around 1344x768 (1.04 MP).  Rendering far above that
+# pushes the DiT out of distribution: skin, hair and fabric turn waxy and
+# detail flattens, which reads as an "AI look" that no post sharpening can
+# repair.  Beyond the native canvas, gain resolution in the pixel domain.
+H3_NATIVE_MEGAPIXELS = 1.04
+
+
+def refine_sigma_start(steps: int, denoise: float) -> float:
+    """Noise coefficient the second sampling pass actually starts from.
+
+    ComfyUI's ``BasicScheduler`` computes ``total_steps = int(steps / denoise)``
+    and then keeps the last ``steps + 1`` entries of that schedule.  The
+    simple scheduler samples MiniMax H3's sigma grid ``(i / 1000) ** 2``, so
+    the returned value is the real noise level of the first refine step -- the
+    ``denoise`` slider only says how much of the schedule is kept.
+    """
+    total = max(1, int(steps / max(float(denoise), 1e-6)))
+    grid = 1000
+    stride = (grid + 1) / total
+    index = max(0, grid - int((total - steps) * stride))
+    return (index / grid) ** 2
+
+
+def _guard_refine_settings(steps: int, denoise: float) -> None:
+    """Reject refine settings that are known to redraw faces into mush.
+
+    The second pass starts at sigma ~0.25 when ``denoise`` is raised without
+    raising ``steps``: the model then has to repaint a face in a handful of
+    Euler steps, which is what turns a character into a melted blob.
+    """
+    sigma = refine_sigma_start(steps, denoise)
+    if sigma > 0.25:
+        raise ValueError(
+            f"二采起点噪声过高（σ={sigma:.2f}）：人物五官会被重新画崩。"
+            f"请把 denoise 降到 0.25 以下（当前 {denoise}）。")
+    if sigma > 0.15 and steps < 12:
+        raise ValueError(
+            f"二采步数不足（σ={sigma:.2f}，只有 {steps} 步）：模型没有足够步数把五官画稳，"
+            f"人物会崩。请把二采步数提到 12 以上，或把 denoise 降到 0.25 以下。")
+
 
 def h3_frames(seconds: float) -> int:
     """Round up to MiniMax H3's 17k+5 grid at 24 fps.
@@ -86,6 +127,74 @@ class Graph:
         self.next_id += 1
         self.nodes[node_id] = {"class_type": kind, "inputs": inputs}
         return [node_id, 0]
+
+
+def _sampler_plan(settings: dict, mode: str, family: str) -> dict:
+    """采样计划：速度档决定步数与采样 LoRA。
+
+    以前步数只听「生成速度」，LoRA 是另一个独立开关，于是会出现「选了 8 步
+    LoRA 却按 4 步跑」——两者看起来相关，实际互不相干。这里把步数、采样
+    LoRA、蒸馏标记收敛成一份计划，引擎建图与运行报告共用同一份结果。
+    """
+    speed = str(settings.get("generation_speed", "turbo"))
+    if speed not in ("turbo4", "turbo", "quality", "goldfish", "smart"):
+        raise ValueError("H3 生成速度无效，请重新选择")
+    goldfish = speed == "goldfish"
+    smart = speed == "smart"
+    turbo = SMART_PRESETS[mode][1] if smart else speed not in ("quality", "goldfish")
+    steps = SMART_PRESETS[mode][0] if smart else 4 if speed == "turbo4" else 8 if turbo else 20
+    if smart and mode in ("t2v", "i2v") and (settings.get("_h3_has_dialogue") or False):
+        # Short 8-step visual previews are a poor default for speech.
+        turbo, steps = False, 16
+    refine_mode = "off" if goldfish else str(settings.get("refine_mode") or "off")
+    if refine_mode not in ("off", "same", "latent", "latent_only", "selflift"):
+        raise ValueError("H3 二采方式无效，请重新选择")
+    if (refine_mode == "off" and settings.get("selflift")
+            and not settings.get("_h3_has_continuity")):
+        # 旧的项目级 selflift 开关：并入 refine_mode=selflift。
+        # 以前它走工作台自研的两阶段采样，那条路径自己决定步数（2-4 步），
+        # 于是「速度选了 8 步」完全不参与，却仍把 8 步 LoRA 挂上去——
+        # 组合既不对步数、也不对 LoRA。现在统一走社区两阶段。
+        refine_mode = "selflift"
+    if refine_mode == "selflift":
+        # The two-stage sampler spends most of its NFEs at the target
+        # resolution; a distilled 4/8-step LoRA flattens exactly the texture
+        # this mode exists to recover.  Force the native weights and keep
+        # enough steps for the high-resolution stage.
+        turbo = False
+        steps = max(steps, 16)
+    dmad_enabled = bool(settings.get("h3_lora_dmad"))
+    # DMAD is a full-strength style LoRA (plain F32 lora_A/B pairs, no
+    # distilled alpha), not a four-step sampler.  Measured on this machine:
+    # running DMAD as the 4-step sampler made swap shots land the wrong
+    # subject on about half of the seeds, and stacking it on top of a
+    # distilled LoRA pushed the sampler past this 24 GB card's LoRA budget
+    # (the run died at "Model Initialization").  It therefore only rides
+    # along in the 20-step quality plan, where there is no distilled sampler
+    # LoRA to collide with.
+    use_dmad = dmad_enabled and speed == "quality" and not goldfish
+    lora_name = None
+    if goldfish:
+        # 金鱼方案自带十步 beta/Euler 调度，不是四步档也不是八步档。
+        steps = 10
+        lora_name = OPTIONAL_H3_LORAS["dmad"]
+    elif turbo:
+        # Each family ships its own distilled LoRA for the 4-step and 8-step
+        # schedules, and that distilled LoRA is the sampler.
+        lora_name = MODELS[family]["lora_4step"] if steps == 4 else MODELS[family]["lora"]
+    return {"speed": speed, "goldfish": goldfish, "turbo": turbo, "steps": steps,
+            "refine_mode": refine_mode, "use_dmad": use_dmad, "dmad_enabled": dmad_enabled,
+            "lora_name": lora_name,
+            "label": ("金鱼高清 · 两阶段" if goldfish else
+                      f"{steps} 步" + ("（" + Path(lora_name).stem.split('.')[0] + "）" if lora_name else "（原生权重）"))}
+
+
+def sampler_summary(settings: dict, mode: str = "t2v") -> dict:
+    """给界面与运行报告看的采样摘要。"""
+    family = "creative" if mode in CREATIVE else "reference"
+    plan = _sampler_plan(settings, mode, family)
+    return {"speed": plan["speed"], "steps": plan["steps"], "lora": plan["lora_name"],
+            "refine_mode": plan["refine_mode"], "label": plan["label"]}
 
 
 def build_h3_graph(shot: dict, settings: dict, media: dict[str, str], prefix: str) -> dict:
@@ -120,34 +229,35 @@ def build_h3_graph(shot: dict, settings: dict, media: dict[str, str], prefix: st
     seed = int(shot.get("seed", 42))
     family = "creative" if mode in CREATIVE else "reference"
     speed = str(settings.get("generation_speed", "turbo"))
-    goldfish = speed == "goldfish"
     model_names = MODELS[family]
+
+    # 采样计划只有一份：建图和运行报告用同一份结果，不会再出现
+    # 「界面写着 8 步、实际跑 4 步」。
+    plan = _sampler_plan(dict(settings, _h3_has_dialogue=bool(shot.get("dialogue_text") or "<d>" in prompt)),
+                          mode, family)
+    speed = plan["speed"]
+    goldfish = plan["goldfish"]
+    turbo = plan["turbo"]
+    steps = plan["steps"]
+    refine_mode = plan["refine_mode"]
 
     g = Graph()
     model = g.add("UNETLoader", unet_name=GOLDFISH_MODELS[family] if goldfish else model_names["unet"], weight_dtype="default")
-    if speed not in ("turbo4", "turbo", "quality", "goldfish", "smart"):
-        raise ValueError("H3 生成速度无效，请重新选择")
-    smart = speed == "smart"
-    turbo = SMART_PRESETS[mode][1] if smart else speed not in ("quality", "goldfish")
-    steps = SMART_PRESETS[mode][0] if smart else 4 if speed == "turbo4" else 8 if turbo else 20
-    if smart and mode in ("t2v", "i2v") and (shot.get("dialogue_text") or "<d>" in prompt):
-        # Short 8-step visual previews are a poor default for speech.
-        turbo, steps = False, 16
-    # Each model family has its own four-step LoRA.  The explicit DMAD choice
-    # uses the shared H3 adapter for either family.
-    use_dmad = bool(settings.get("h3_lora_dmad")) and speed == "turbo4"
+    # Each model family has its own distilled LoRA for the 4-step and 8-step
+    # schedules; that distilled LoRA is the sampler.  DMAD is a style LoRA and
+    # only rides along in the 20-step quality plan.
+    use_dmad = plan["use_dmad"]
     if goldfish:
         # Match the supplied YZ workflow: DMAD is run at 0.8 alongside a
         # ten-step beta/Euler schedule, not used as the four-step preset.
         model = g.add("LoraLoaderModelOnly", model=model,
                       lora_name=OPTIONAL_H3_LORAS["dmad"], strength_model=0.8)
     elif turbo:
-        # DMAD is itself a 4-step H3 sampler LoRA.  It replaces LightX2V;
-        # loading both would apply two incompatible 4-step deltas to the
-        # same model and makes any comparison meaningless.
-        lora_name = (OPTIONAL_H3_LORAS["dmad"] if use_dmad
-                     else model_names["lora_4step"] if steps == 4 else model_names["lora"])
-        model = g.add("LoraLoaderModelOnly", model=model, lora_name=lora_name, strength_model=1)
+        model = g.add("LoraLoaderModelOnly", model=model, lora_name=plan["lora_name"], strength_model=1)
+    if use_dmad:
+        dmad_strength = float(settings.get("h3_lora_dmad_strength", 0.6))
+        model = g.add("LoraLoaderModelOnly", model=model,
+                      lora_name=OPTIONAL_H3_LORAS["dmad"], strength_model=dmad_strength)
     # Artistic/action LoRAs are opt-in.  Loading them only when checked keeps
     # the default workflow's VRAM footprint and appearance unchanged.
     for key, lora_name in OPTIONAL_H3_LORAS.items():
@@ -340,23 +450,38 @@ def build_h3_graph(shot: dict, settings: dict, media: dict[str, str], prefix: st
                         lowres_scale=0.6, rho=0.0, w_min=0.5, w_max=1.0,
                         upscaler_model=GOLDFISH_UPSCALER,
                         highres_tiling=True, upscaler_unload=True)
-    elif settings.get("selflift") and family == "creative" and not shot.get("continuity_video"):
-        sampled = g.add("H3StudioSelfLift", model=base_model, positive=conditioning,
-                        latent=latent, vae=vae, seed=seed,
-                        lowres_scale=float(settings.get("selflift_scale", 0.5)),
-                        highres_steps=int(settings.get("selflift_highres_steps", 2)),
-                        rho=float(settings.get("selflift_rho", 0)),
-                        latent_model=str(settings.get("latent_model") or "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"),
-                        enable_tiling=bool(settings.get("selflift_tiling", False)),
-                        tile_count=int(settings.get("selflift_tile_count", 2)),
-                        tile_overlap=int(settings.get("selflift_tile_overlap", 128)))
+    elif refine_mode == "selflift" and family == "reference" and list(shot.get("ref_images") or []):
+        # 参考图镜头的 Picture token 会加长序列，而两阶段采样器只重排视频 token，
+        # 低清前缀与高清序列对不上（shape mismatch）。这类镜头改用原画布轻量精修。
+        refine_mode = "same"
+    elif refine_mode == "selflift":
+        # Community two-stage sampling (comfyui-SelfLift): the first NFEs run
+        # on a low-resolution prefix, the endpoint is lifted to the target
+        # canvas with H3's learned LMS latent upscaler, and the remaining NFEs
+        # finish the shot at the target resolution.  This is the recipe that
+        # actually buys face and fabric detail instead of re-drawing a picture
+        # that was already soft.  H3 keyframe guides survive the resolution
+        # change because the node resizes the guide latents with the prefix.
+        negative = g.add("ConditioningZeroOut", conditioning=conditioning)
+        sampler = g.add("KSamplerSelect", sampler_name="euler")
+        schedule = g.add("BasicScheduler", model=model, scheduler="simple", steps=steps, denoise=1)
+        transition_step = max(1, min(int(settings.get("refine_transition_step", 6)), steps - 2))
+        sampled = g.add("SelfLiftH3Sampler", model=model, positive=conditioning,
+                        negative=negative, vae=vae, latent_image=latent, sampler=sampler,
+                        sigmas=schedule, seed=seed, cfg=1.0, transition_step=transition_step,
+                        lowres_scale=float(settings.get("refine_lowres_scale", 0.6)),
+                        rho=float(settings.get("refine_rho", 0.0)),
+                        w_min=float(settings.get("refine_w_min", 0.5)),
+                        w_max=float(settings.get("refine_w_max", 1.0)),
+                        upscaler_model=str(settings.get("refine_upscaler") or GOLDFISH_UPSCALER),
+                        highres_tiling=bool(settings.get("refine_tiling", True)),
+                        upscaler_unload=True)
     else:
         sampler = g.add("KSamplerSelect", sampler_name="res_multistep")
         schedule = g.add("BasicScheduler", model=model, scheduler="simple", steps=steps, denoise=1)
         guider = g.add("BasicGuider", model=model, conditioning=conditioning)
         noise = g.add("RandomNoise", noise_seed=seed)
         sampled = g.add("SamplerCustomAdvanced", noise=noise, guider=guider, sampler=sampler, sigmas=schedule, latent_image=latent)
-    refine_mode = "off" if goldfish else str(settings.get("refine_mode") or "off")
     if refine_mode in ("same", "latent", "latent_only"):
         pre_images = g.add("VAEDecode", samples=sampled, vae=vae)
         pre_audio = g.add("VAEDecodeAudio", samples=sampled, vae=audio_vae)
@@ -367,7 +492,9 @@ def build_h3_graph(shot: dict, settings: dict, media: dict[str, str], prefix: st
         target_w = int(settings.get("refine_width") or width)
         target_h = int(settings.get("refine_height") or height)
         if target_w % 32 or target_h % 32 or target_w < width or target_h < height:
-            raise ValueError("H3 latent 放大画布须为 32 的倍数且不小于原画布")
+            raise ValueError(
+                "H3 latent 放大画布须为 32 的倍数且不小于原画布"
+                f"（当前画布 {width}×{height}，放大目标 {target_w}×{target_h}）")
         lifted = g.add("H3StudioLatentUpscale", positive=conditioning, latent=sampled,
                        target_width=target_w, target_height=target_h,
                        latent_model=str(settings.get("latent_model") or "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"))
@@ -376,6 +503,10 @@ def build_h3_graph(shot: dict, settings: dict, media: dict[str, str], prefix: st
         refine_steps = max(1, min(16, int(settings.get("refine_steps", 4))))
         refine_denoise = max(0.01, min(1.0, float(settings.get("refine_denoise", 0.3))))
         passes = max(1, min(8, int(settings.get("refine_passes", 1))))
+        _guard_refine_settings(refine_steps, refine_denoise)
+        # H3 packs audio and video into one latent, so the refine pass would
+        # redraw the dialogue.  Keep the first pass audio branch untouched.
+        first_pass_latent = sampled
         for pass_index in range(passes):
             refine_guider = g.add("BasicGuider", model=model, conditioning=conditioning)
             refine_sampler = g.add("KSamplerSelect", sampler_name="euler")
@@ -384,6 +515,7 @@ def build_h3_graph(shot: dict, settings: dict, media: dict[str, str], prefix: st
             refine_noise = g.add("RandomNoise", noise_seed=(seed + pass_index + 1) % (1 << 64))
             sampled = g.add("SamplerCustomAdvanced", noise=refine_noise, guider=refine_guider,
                             sampler=refine_sampler, sigmas=refine_schedule, latent_image=sampled)
+        sampled = g.add("H3StudioKeepFirstAudio", refined=sampled, original=first_pass_latent)
     images = g.add("VAEDecode", samples=sampled, vae=vae)
     audio = g.add("VAEDecodeAudio", samples=sampled, vae=audio_vae)
     video = g.add("CreateVideo", images=images, audio=audio, fps=24, bit_depth=8)
@@ -611,6 +743,68 @@ META_NOTE_RE = re.compile(
     r"旁白[^。！？\n]{0,12}(?:不合理|加速|减速|因为))")
 
 
+def _lint_render_settings(settings: dict, shot: dict, add) -> None:
+    """Surface render settings that quietly cost face detail."""
+    width = int(settings.get("width") or 1344)
+    height = int(settings.get("height") or 768)
+    megapixels = width * height / 1_000_000
+    if megapixels > H3_NATIVE_MEGAPIXELS * 1.05:
+        add("warning", "canvas_above_native",
+            f"画布 {width}×{height}（{megapixels:.2f} MP）超出 H3 原生 {H3_NATIVE_MEGAPIXELS:.2f} MP 画布："
+            "模型会跑在分布之外，皮肤和织物容易发蜡发平，正是「AI 味重」的来源。"
+            "建议画布回到 1344×768，需要更大分辨率就用像素域超分（SeedVR2）补。")
+    refine_mode = str(settings.get("refine_mode") or "off")
+    attention_mode = str(settings.get("attention_mode")
+                         or ("sage" if settings.get("sage_attention") else "off"))
+    if attention_mode == "off":
+        add("warning", "attention_sage_off",
+            "注意力后端当前是「默认」：本机实测同一镜头开 SageAttention 每步快约 2 倍"
+            "（参考模式 77 秒/步 → 38 秒/步）。建议把「注意力后端」改成 sage。")
+    speed = str(settings.get("generation_speed") or "turbo")
+    if settings.get("h3_lora_dmad") and speed != "quality" and speed != "goldfish":
+        add("warning", "dmad_not_in_fast_plan",
+            "DMAD 是全量风格 LoRA（不是四步蒸馏采样器）：四步/八步档已改用家族自带的蒸馏 LoRA 采样，"
+            "DMAD 不再参与——实测用它跑 4 步时，换人镜头约一半 seed 会没换成功；"
+            "叠加在蒸馏 LoRA 之上还会超出本机显存。要用 DMAD 风格，请把「生成速度」改成「标准画质 20 步」。")
+    if refine_mode in ("same", "latent", "latent_only"):
+        refine_steps = max(1, min(16, int(settings.get("refine_steps", 4))))
+        refine_denoise = max(0.01, min(1.0, float(settings.get("refine_denoise", 0.3))))
+        sigma = refine_sigma_start(refine_steps, refine_denoise)
+        if sigma > 0.25:
+            add("error", "refine_sigma_too_high",
+                f"二采起点噪声 σ={sigma:.2f} 过高，人物五官会被重新画崩。"
+                f"请把 denoise 降到 0.25 以下（当前 {refine_denoise}）。")
+        elif sigma > 0.15 and refine_steps < 12:
+            add("error", "refine_steps_too_low",
+                f"二采起点噪声 σ={sigma:.2f} 但只有 {refine_steps} 步：模型没有足够步数把五官画稳。"
+                f"请把二采步数提到 12 以上，或把 denoise 降到 0.25 以下。")
+        else:
+            add("ok", "refine_settings_safe",
+                f"二采参数安全：起点噪声 σ={sigma:.2f}，{refine_steps} 步"
+                + ("，音轨锁定首采。" if refine_mode in ("same", "latent") else "。"))
+    elif refine_mode == "selflift":
+        if shot.get("mode") in ("r2v", "v2v", "rv2v") and (shot.get("ref_images") or []):
+            add("error", "refine_selflift_with_reference",
+                "这个镜头带参考图，两阶段 SelfLift 会因为参考图 token 与低清前缀对不上而崩溃；"
+                "请把二采方式改成「原画布精修」，或改用无参考图的生成方式。")
+        else:
+            add("ok", "refine_selflift",
+                "二采使用社区两阶段采样：低清前缀 + H3 学习式 latent 放大 + 高清续采，"
+                "音轨随轨迹延续，keyframe 引导会随分辨率重建。")
+    if settings.get("face_refine"):
+        add("warning", "face_refine_enabled",
+            "人脸细节增强已开启：检测到的人脸会做局部超分，但不能纠正五官结构错误；"
+            "远景脸只有十几像素时，请优先调整镜头构图或提高原生渲染分辨率。")
+    if settings.get("upscale"):
+        resolution = int(settings.get("upscale_resolution") or 720)
+        max_resolution = int(settings.get("upscale_max_resolution") or 1280)
+        if min(resolution / max(1, min(width, height)),
+               max_resolution / max(1, max(width, height))) <= 1.01:
+            add("warning", "upscale_would_skip",
+                f"超分已开启但门槛不满足：{resolution}p / {max_resolution}px 不高于当前画布 {width}×{height}，"
+                "这一步会被直接跳过，等于没开。")
+
+
 def lint_shot_prompt(shot: dict, settings: dict | None = None) -> list[dict]:
     """Report actionable prompt and duration issues without blocking drafts."""
     prompt = str(shot.get("prompt") or "").strip()
@@ -690,6 +884,14 @@ def lint_shot_prompt(shot: dict, settings: dict | None = None) -> list[dict]:
                     break
     if (shot.get("mode") in ("r2v", "v2v", "rv2v")
             and _person_replacement_requested(shot)):
+        animal = next((_animal_identity_kind(shot, int(number))
+                       for number in re.findall(r"<Picture\s*(\d+)>", prompt, re.I)
+                       if _animal_identity_kind(shot, int(number))), "")
+        if animal and shot.get("source_video"):
+            add("warning", "animal_source_pose_conflict",
+                "参考图要求真实四足动物，但源视频含人的动作/站姿时，视频编辑模型仍可能生成动物头配人形身体。"
+                "提高像素或增加采样步数不能消除这个条件冲突；优先换成同种动物动作源视频，"
+                "或改用首帧/图生视频来确定完整动物体态。")
         tuned = []
         if settings and settings.get("h3_lora_mystic"):
             tuned.append("已自动跳过 Mystic 风格 LoRA（它会改写脸部特征）")
@@ -727,6 +929,8 @@ def lint_shot_prompt(shot: dict, settings: dict | None = None) -> list[dict]:
         add("warning", "narration_duplicated",
             f"这段旁白在提示词里出现了 {shot['_h3_narration_duplicated']} 次（常见于引号不配对），"
             "实测会让 H3 重复或含糊地念，请只保留一处并补全引号。")
+    if settings:
+        _lint_render_settings(settings, shot, add)
     note = META_NOTE_RE.search(prompt)
     if note:
         snippet = prompt[max(0, note.start() - 12):note.end() + 12].replace("\n", " ")
@@ -766,6 +970,19 @@ def _is_identity_reference(shot: dict, asset_id: str, name: str, visual_descript
                     "replace", "identity", "appearance", "outfit")):
                 return True
     return False
+
+
+def _animal_identity_kind(shot: dict, picture_number: int) -> str:
+    """Use an explicitly tagged animal identity instead of a stale human sheet label."""
+    prompt = str(shot.get("prompt") or "")
+    tag = rf"<Picture\s*{picture_number}>"
+    for match in re.finditer(tag, prompt, re.IGNORECASE):
+        nearby = prompt[max(0, match.start() - 45):match.end() + 70]
+        for name, pattern in (("cat", r"猫|\bcat\b|\bfeline\b"),
+                              ("dog", r"狗|犬|\bdog\b|\bcanine\b")):
+            if re.search(pattern, nearby, re.IGNORECASE):
+                return name
+    return ""
 
 
 def _requests_person_replacement(shot: dict) -> bool:
@@ -853,24 +1070,42 @@ def _compile_full_reference_prompt(shot: dict, description: str, soundscape: str
     identity_images = {asset_id for asset_id in images
                        if _is_identity_reference(shot, asset_id, asset_name(asset_id),
                                                  str(descriptions.get(asset_id) or ""))}
+    animal_identities = {asset_id: _animal_identity_kind(shot, index)
+                         for index, asset_id in enumerate(images, 1) if asset_id in identity_images}
     for i, asset_id in enumerate(images, 1):
         name = asset_name(asset_id)
         visual_description = str(descriptions.get(asset_id) or "").strip()
         detail = f' Verified user description: {visual_description}.' if visual_description else ''
         if asset_id in identity_images:
-            definitions.append(f'<Picture {i}> is the identity reference ({name}) for the person in this shot.'
-                               f'{detail} Preserve this person’s face, hair, build, and clothing. '
-                               'Use it for the identity role requested in the detailed shot description. The user’s '
-                               'description and loaded Skill determine whether any other visible property of this image '
-                               'should be used; do not add extra copies of the person by default. '
-                               'Its environment, palette and lighting may also carry into the shot when the detailed '
-                               'shot description asks for them.')
+            animal = animal_identities.get(asset_id)
+            if animal:
+                # Auto-generated multiview descriptions can still say "person"
+                # after a sheet is replaced by a cat or dog. Never let that
+                # stale label compete with the explicit tagged shot identity.
+                detail = ('' if re.search(r"人物|人脸|服装|\bperson\b|\bhuman\b", visual_description, re.I)
+                          else detail)
+                definitions.append(f'<Picture {i}> is the identity reference ({name}) for the {animal} in this shot.'
+                                   f'{detail} Preserve the animal’s species, face, coat markings, body proportions, '
+                                   'and natural anatomy. The subject is a real quadruped, not a human or humanoid '
+                                   'with an animal head. Do not copy a human skeleton, standing pose, hands, legs, '
+                                   'hair or clothing from the source video or a stale reference label. '
+                                   'The detailed shot description decides the setting and visual style.')
+            else:
+                definitions.append(f'<Picture {i}> is the identity reference ({name}) for the person in this shot.'
+                                   f'{detail} Preserve this person’s face, hair, build, and clothing. '
+                                   'Use it for the identity role requested in the detailed shot description. The user’s '
+                                   'description and loaded Skill determine whether any other visible property of this image '
+                                   'should be used; do not add extra copies of the person by default. '
+                                   'Its environment, palette and lighting may also carry into the shot when the detailed '
+                                   'shot description asks for them.')
             if any(word in (name + " " + visual_description).lower() for word in
                    ("四视图", "五视图", "六视图", "三视图", "多视图", "多视角", "multiview", "turnaround", "face sheet")):
-                definitions.append(f'<Picture {i}> is a multi-view identity sheet. Use it to lock the person’s '
-                                   'face, body proportions and outfit; never render the sheet’s grid or panels as the '
-                                   'video frame. Its environment, palette and lighting may still carry into the shot '
-                                   'when the detailed shot description asks for that.')
+                anatomy = (f'the {animal}’s face, coat markings and quadruped anatomy' if animal
+                           else 'the person’s face, body proportions and outfit')
+                definitions.append(f'<Picture {i}> is a multi-view identity sheet. Use it to lock {anatomy}; '
+                                   'never render the sheet’s grid or panels as the video frame. Its environment, '
+                                   'palette and lighting may still carry into the shot when the detailed shot '
+                                   'description asks for that.')
         else:
             definitions.append(f'<Picture {i}> is a visual reference ({name}).{detail} Its role is exactly the one '
                                'assigned to this tag in the detailed shot description. The user’s description and '
@@ -902,6 +1137,7 @@ def _compile_full_reference_prompt(shot: dict, description: str, soundscape: str
                            "reference content. Let the user’s description determine subjects, actions, composition, and "
                            "which visual properties from each reference are used.")
     replace_person = _person_replacement_requested(shot)
+    replacement_animal = next((kind for kind in animal_identities.values() if kind), "")
     for i, asset_id in enumerate(ordered_videos, 1):
         name = asset_name(asset_id)
         is_source = bool(source_video and i == 1 and asset_id == source_video)
@@ -914,7 +1150,12 @@ def _compile_full_reference_prompt(shot: dict, description: str, soundscape: str
         if marker not in ("fully_preserved", "partially_preserved", "attribute_transfer", "weak_reference"):
             marker = default
         if is_source and replace_person:
-            if marker == "weak_reference":
+            if replacement_animal:
+                note = (f"borrow only the source's camera path, broad action timing and scene rhythm; replace the "
+                        f"human subject with the {replacement_animal} from the identity picture. Adapt any human "
+                        "movement to natural quadruped motion. Do not retain the source's human body, skeleton, "
+                        "upright stance, hand gestures or clothing")
+            elif marker == "weak_reference":
                 # The author demoted the source to "motion/rhythm only" — most
                 # often to rebuild the scene around the swapped person.  The
                 # generic note would still claim the framing is retained and

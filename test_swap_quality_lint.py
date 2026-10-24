@@ -48,6 +48,10 @@ class SwapQualityLintTests(unittest.TestCase):
         self.assertNotIn("swap_ref_image_size", codes)
         self.assertNotIn("swap_fast_steps", codes)
 
+    def test_animal_replacement_warns_about_human_source_pose(self):
+        shot = _swap_shot(source_video="human-video", prompt="画面主体是 <Picture 1> 里那只猫，按四足体态行走。")
+        self.assertIn("animal_source_pose_conflict", _codes(shot, {"generation_speed": "quality"}))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -199,6 +199,26 @@ def change(fn):
         return result
 
 
+ACTIVE_RUN_STATUSES = frozenset(("queued", "running", "awaiting_upscale"))
+
+
+def active_run(data: dict, exclude_id: str = "") -> dict | None:
+    """Return a director task that has not finished all of its processing."""
+    return next((run for run in data["runs"].values()
+                 if run.get("id") != exclude_id and run.get("status") in ACTIVE_RUN_STATUSES), None)
+
+
+def reserve_runs(runs: list[dict]) -> dict | None:
+    """Atomically admit one task (or one batch) only while the director is idle."""
+    def reserve(data):
+        busy = active_run(data)
+        if busy:
+            return busy
+        data["runs"].update({run["id"]: run for run in runs})
+        return None
+    return change(reserve)
+
+
 def project_asset_ids(project: dict) -> set[str]:
     """Return every asset ID referenced by one project."""
     ids = set((project.get("image_descriptions") or {}).keys())
@@ -427,6 +447,10 @@ def new_project(name: str) -> dict:
         "selflift_rho": 0, "latent_model": "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors",
         "selflift_tiling": False, "selflift_tile_count": 2, "selflift_tile_overlap": 128,
         "refine_mode": "off", "refine_steps": 4, "refine_denoise": 0.3,
+        # 社区两阶段采样（selflift）：低清前缀 + H3 学习式 latent 放大 + 高清续采
+        "refine_transition_step": 6, "refine_lowres_scale": 0.6, "refine_rho": 0.0,
+        "refine_w_min": 0.5, "refine_w_max": 1.0, "refine_tiling": True,
+        "refine_upscaler": "h3_upscaler_lms_v0.1.safetensors",
         "refine_passes": 1,
         "refine_width": 1536, "refine_height": 864,
         "clear_vram_between_shots": False,
@@ -439,6 +463,8 @@ def new_project(name: str) -> dict:
         "seam_motion_frames": 3,
         "seam_exposure": True,
         "upscale_resolution": 720, "upscale_max_resolution": 1280,
+        # 成片尺寸：超分后的镜头统一裁成这个尺寸（0 表示不重采样）
+        "output_width": 0, "output_height": 0,
         "shared_refs": {"images": [], "videos": [], "audios": []},
         "image_descriptions": {},
         "shared_prompt": "",

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from server.router import Route
 
-from engine import ALL_MODES
+from engine import ALL_MODES, _guard_refine_settings
 from engine import build_h3_graph
 from packs import export_director_pack
 from packs import export_pack
@@ -11,7 +11,7 @@ from pathlib import Path
 from reference_numbering import normalized_project_image_references
 from reference_numbering import renumber_project_image_references
 from runner import api
-from runner import prepare_shot
+from runner import prepare_shot, shot_refine_mode
 from runner import remerge_run
 from runner import run_project
 from server.config import COMFY_DIR
@@ -25,6 +25,7 @@ from store import new_project
 from store import new_shot
 from store import project_asset_ids
 from store import read
+from store import reserve_runs
 from store import uid
 from timeline_ops import edit_timeline
 from video_tools import boundaries
@@ -243,7 +244,8 @@ def post_api_projects_run(req, path, parts, url):
             raise ValueError(f"镜头 {shot['name']} 引用了不存在的素材：{missing[0]}")
         media = {asset_id: assets[asset_id]["file"] for asset_id in ids}
         try:
-            graph = build_h3_graph(preview, project, media, "preflight")
+            shot_settings = {**project, "refine_mode": shot_refine_mode(shot, project)}
+            graph = build_h3_graph(preview, shot_settings, media, "preflight")
         except (ValueError, KeyError) as error:
             raise ValueError(f"镜头 {shot['name']}：{error}") from error
         for node in graph.values():
@@ -271,7 +273,9 @@ def post_api_projects_run(req, path, parts, url):
         adapter = project["semantic_adapter"]
         if Path(adapter).name != adapter or not (COMFY_DIR / "models" / "semantic_bridge" / adapter).is_file():
             raise ValueError("语义桥适配器文件不存在")
-    if project.get("generation_speed") != "goldfish" and (project.get("selflift") or project.get("refine_mode") in ("latent", "latent_only")):
+    if project.get("generation_speed") != "goldfish" and (project.get("selflift") or any(
+            shot_refine_mode(shot, project) in ("latent", "latent_only")
+            for shot in project["shots"] if shot["id"] in selected)):
         model_name = project.get("latent_model", "")
         if Path(model_name).name != model_name or not (COMFY_DIR / "models" / "latent_upscale_models" / model_name).is_file():
             raise ValueError("H3 3D latent 权重文件不存在")
@@ -300,7 +304,11 @@ def post_api_projects_run(req, path, parts, url):
            "status": "queued", "current": "", "results": [], "created_at": time.time()}
     if reroll_shot_id:
         run.update(reroll_shot_id=reroll_shot_id, source_run_id=source_run_id)
-    change(lambda data: data["runs"].__setitem__(run_id, run))
+    busy = reserve_runs([run])
+    if busy:
+        req.json(409, {"error": "请等待当前任务全部完成后再启动下一个任务",
+                       "active_run_id": busy.get("id")})
+        return
     threading.Thread(target=run_project, args=(run_id,), daemon=True).start()
     req.json(202, run)
     return
@@ -337,6 +345,17 @@ def put_api_projects(req, path, parts, url):
     project["height"] = align_dimension(project.get("height"), 768)
     if project.get("memory_policy", "manual") not in ("manual", "auto_vram"):
         raise ValueError("显存画布模式无效")
+    refine_mode = str(project.get("refine_mode") or "off")
+    if refine_mode not in ("off", "selflift", "same", "latent", "latent_only"):
+        raise ValueError("二采档位只能是 off / selflift / same / latent / latent_only")
+    if refine_mode in ("same", "latent", "latent_only"):
+        # 二采的危险组合在写项目时就拦下，别等渲染建图时才炸：
+        # denoise 拉高而步数不跟着加，模型会在几步内把五官重画一遍。
+        try:
+            _guard_refine_settings(int(project.get("refine_steps") or 4),
+                                   float(project.get("refine_denoise") or 0.3))
+        except ValueError as error:
+            raise ValueError(str(error)) from error
     if project.get("continuous_render_mode", "auto") not in ("auto", "segmented"):
         raise ValueError("一镜到底生成方式无效")
     if project.get("seam_mode", "auto") not in ("auto", "conservative", "manual"):

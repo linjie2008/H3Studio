@@ -14,6 +14,15 @@ def duration(path: Path) -> float:
     return float(json.loads(result.stdout)["format"]["duration"])
 
 
+def dimensions(path: Path) -> tuple[int, int]:
+    """Return (width, height) of the first video stream; (0, 0) when unknown."""
+    result = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                             "-show_entries", "stream=width,height", "-of", "json", str(path)],
+                            capture_output=True, text=True, check=True, timeout=30)
+    streams = json.loads(result.stdout).get("streams") or [{}]
+    return int(streams[0].get("width") or 0), int(streams[0].get("height") or 0)
+
+
 def extract_audio_track(source: Path, target: Path) -> None:
     """Extract the first audio stream to lossless FLAC for use as an H3 reference."""
     probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0",

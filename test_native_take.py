@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from runner import _native_take_shot
+from runner import _native_take_shot, shot_refine_mode, shot_upscale
 from store import new_project, new_shot
 
 
@@ -50,6 +50,24 @@ class NativeTakeTests(unittest.TestCase):
         project["shots"] = [new_shot(), new_shot()]
         project["continuous_render_mode"] = "segmented"
         self.assertIsNone(_native_take_shot(project["shots"], project))
+
+    def test_shot_postprocessing_overrides_project_defaults(self):
+        project = new_project("shot postprocessing")
+        project.update(refine_mode="latent", upscale=True)
+        first, second = new_shot(), new_shot()
+        first.update(mode="r2v", refine_mode="off", upscale=False)
+        second.update(mode="r2v", refine_mode="same", upscale=True)
+        project["shots"] = [first, second]
+        self.assertEqual(shot_refine_mode(first, project), "off")
+        self.assertFalse(shot_upscale(first, project))
+        self.assertEqual(shot_refine_mode(second, project), "same")
+        self.assertTrue(shot_upscale(second, project))
+        self.assertIsNone(_native_take_shot(project["shots"], project))
+        project["shots"] = [first, new_shot()]
+        self.assertEqual(shot_refine_mode(project["shots"][1], project), "latent")
+        self.assertTrue(shot_upscale(project["shots"][1], project))
+        project["generation_speed"] = "goldfish"
+        self.assertEqual(shot_refine_mode(second, project), "off")
 
 
 if __name__ == "__main__":

@@ -113,6 +113,7 @@ ORDER = [
     ('POST', 'post_api_projects_split'),
     ('POST', 'post_api_projects_remerge'),
     ('POST', 'post_api_projects_run'),
+    ('POST', 'post_api_run_post_upscale'),
     ('POST', 'post_api_runs_decision'),
     ('POST', 'post_api_runs_resume'),
     ('DELETE', 'delete_api_ai_settings'),

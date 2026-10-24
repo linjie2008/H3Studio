@@ -33,6 +33,23 @@ class SourceVideoBackgroundTests(unittest.TestCase):
         self.assertIn("<Video 1> (source edit): partially_preserved", prompt)
         self.assertIn("camera movement, framing and timing are retained", prompt)
 
+    def test_cat_identity_does_not_inherit_stale_human_multiview_description(self):
+        shot = {
+            "mode": "rv2v", "source_video": "source", "replace_person": True,
+            "ref_images": ["sheet"],
+            "prompt": "画面主体是 <Picture 1> 里那只猫，保持真实四足体态。",
+            "_h3_reference_names": {"sheet": "角色 2 · 四视图", "source": "human.mp4"},
+            "_h3_reference_descriptions": {
+                "sheet": "同一人物的脸部特写、正面、侧面和背面；用于稳定脸、身形与服装。"},
+        }
+        prompt = _compile_full_reference_prompt(shot, shot["prompt"], "N/A", "N/A")
+        definitions = prompt.split("summary:")[0]
+        self.assertIn("for the cat in this shot", definitions)
+        self.assertIn("quadruped anatomy", definitions)
+        self.assertNotIn("for the person in this shot", definitions)
+        self.assertNotIn("Verified user description: 同一人物", definitions)
+        self.assertIn("Adapt any human movement to natural quadruped motion", prompt)
+
 
 class SwapSkillTests(unittest.TestCase):
     def test_swap_skill_is_loaded_with_its_reference(self):

@@ -32,7 +32,7 @@ from prompt_tools import (enhance, enhance_sequence, storyboard as generate_stor
                           suggest_project_parameters, recommend_project_skills,
                           _deepseek_complete, _deepseek_complete_request)
 from prompt_skills import DEFAULT_SKILL, delete_skill, import_skill, list_skills, preview_skill
-from runner import (COMFY_URL, api, prepare_shot, run_project, remerge_run,
+from runner import (COMFY_URL, api, prepare_shot, run_project, run_post_upscale, remerge_run,
                     _prompt_state, _shot_identity_refs)
 from store import (ASSETS, OUTPUTS, align_dimension, change, clone_project, new_project,
                    new_shot, project_asset_ids, read, scope_legacy_assets, storage_status, uid)
@@ -290,5 +290,7 @@ if __name__ == "__main__":
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"H3 Studio: http://127.0.0.1:{PORT} → {COMFY_URL}", flush=True)
     for run_id in recoverable:
-        threading.Thread(target=run_project, args=(run_id,), daemon=True).start()
+        run = read()["runs"].get(run_id, {})
+        worker = run_post_upscale if run.get("kind") == "post_upscale" else run_project
+        threading.Thread(target=worker, args=(run_id,), daemon=True).start()
     server.serve_forever()

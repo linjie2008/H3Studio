@@ -9,6 +9,7 @@ from server.support import generate_multiview_batch
 from server.support import make_multiview_job
 from store import change
 from store import read
+from store import reserve_runs
 from store import uid
 import threading
 import time
@@ -86,7 +87,11 @@ def post_api_projects_batch_multiview(req, path, parts, url):
         job["batch_position"] = index
         job["batch_total"] = len(jobs)
         job["current"] = f"批量排队 {index}/{len(jobs)}"
-    change(lambda data: data["runs"].update({job["id"]: job for job in jobs}))
+    busy = reserve_runs(jobs)
+    if busy:
+        req.json(409, {"error": "请等待当前任务全部完成后再启动批量生图",
+                       "active_run_id": busy.get("id")})
+        return
     threading.Thread(target=generate_multiview_batch,
                      args=([job["id"] for job in jobs],), daemon=True).start()
     req.json(202, {"batch_id": batch_id, "jobs": jobs})
@@ -104,7 +109,11 @@ def post_api_projects_character_multiview(req, path, parts, url):
         raise ValueError("当前有角色批量任务在生成，请等待批量任务完成")
     job = make_multiview_job(state, parts[2], parts[4], body)
     job_id = job["id"]
-    change(lambda data: data["runs"].__setitem__(job_id, job))
+    busy = reserve_runs([job])
+    if busy:
+        req.json(409, {"error": "请等待当前任务全部完成后再生图",
+                       "active_run_id": busy.get("id")})
+        return
     threading.Thread(target=generate_multiview, args=(job_id,), daemon=True).start()
     req.json(202, job)
     return
@@ -142,7 +151,11 @@ def post_api_projects_entity_image(req, path, parts, url):
            "description": description[:1800], "source_asset": source_id or None,
            "mode": mode, "preset": preset, "status": "queued",
            "current": "等待 ComfyUI", "created_at": time.time()}
-    change(lambda data: data["runs"].__setitem__(job_id, job))
+    busy = reserve_runs([job])
+    if busy:
+        req.json(409, {"error": "请等待当前任务全部完成后再生图",
+                       "active_run_id": busy.get("id")})
+        return
     threading.Thread(target=generate_profile_image, args=(job_id,), daemon=True).start()
     req.json(202, job)
     return

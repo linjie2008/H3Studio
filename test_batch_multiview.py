@@ -63,14 +63,16 @@ class BatchMultiviewTests(unittest.TestCase):
                                           "view_layout": "four"}
         parts = ["api", "projects", "project", "characters", "bob", "multiview"]
         with patch.object(job_routes, "read", return_value=self.state), \
-                patch.object(job_routes, "change") as change, \
+                patch.object(job_routes, "reserve_runs",
+                             side_effect=lambda runs: self.state["runs"].update(
+                                 {job["id"]: job for job in runs}) or None) as reserve, \
                 patch.object(job_routes.threading, "Thread") as thread:
             job_routes.post_api_projects_character_multiview(request, "", parts, None)
         job = request.json.call_args.args[1]
         self.assertEqual(request.json.call_args.args[0], 202)
         self.assertEqual((job["character_id"], job["source_asset"], job["engine"]),
                          ("bob", "source", "krea2"))
-        change.call_args.args[0](self.state)
+        reserve.assert_called_once_with([job])
         self.assertIs(self.state["runs"][job["id"]], job)
         thread.assert_called_once_with(target=job_routes.generate_multiview,
                                        args=(job["id"],), daemon=True)

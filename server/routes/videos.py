@@ -55,6 +55,10 @@ def get_api_videos(req, path, parts, url):
                 "elapsed_seconds": max(0, int(run["finished_at"] - run["started_at"]))
                     if run.get("finished_at") and run.get("started_at") else None,
                 "size": target.stat().st_size})
+        if run.get("kind") == "post_upscale":
+            add(run.get("merged"), "merged", "SeedVR2 超分成片",
+                run.get("source_shot_id", ""))
+            continue
         for result in run.get("results", []):
             shot_id = result.get("shot_id", "")
             shot_name = result.get("title") or shot_names.get(shot_id, run.get("imported_title") or "镜头成片")

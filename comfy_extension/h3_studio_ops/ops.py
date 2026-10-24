@@ -137,6 +137,42 @@ class H3StudioSelfLift:
         return (output,)
 
 
+class H3StudioKeepFirstAudio:
+    """Keep the first pass audio stream while the video stream is re-sampled.
+
+    MiniMax H3 packs video and audio into one nested latent, so a second
+    sampling pass noises and redraws the soundtrack together with the
+    picture. The community two-stage recipe keeps the audio branch at zero
+    noise: the dialogue established by the first pass stays untouched while
+    only the image is refined.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "refined": ("LATENT",), "original": ("LATENT",),
+        }}
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "keep"
+    CATEGORY = "H3 Studio"
+
+    def keep(self, refined, original):
+        new_streams = _streams_from_latent(refined)
+        old_streams = _streams_from_latent(original)
+        if len(old_streams) < 2:
+            # Nothing but video in this latent; the refined stream is final.
+            return (refined,)
+        audio = old_streams[1:]
+        if len(new_streams) != len(audio) + 1:
+            raise ValueError("H3 保音轨：精采与首采的流数量不一致")
+        for new_audio, old_audio in zip(new_streams[1:], audio):
+            if new_audio.shape != old_audio.shape:
+                raise ValueError("H3 保音轨：精采与首采的音频流尺寸不一致")
+        out = dict(refined)
+        out["samples"] = _repack_av_streams([new_streams[0], *audio], refined)
+        return (out,)
+
+
 class H3StudioLatentUpscale:
     @classmethod
     def INPUT_TYPES(cls):

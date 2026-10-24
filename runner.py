@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import hashlib
 import json
 import math
@@ -22,6 +23,7 @@ from engine import build_h3_graph, build_seedvr2_graph, director_control_text
 from memory_plan import fit_canvas, plan_canvas
 from reference_numbering import normalized_project_image_references
 from store import ASSETS, OUTPUTS, change, read
+from video_tools import dimensions as video_dimensions
 from video_tools import duration as video_duration
 
 
@@ -117,6 +119,7 @@ def _preserve_spoken_seam(previous: dict, current: dict, overlap_frames: int) ->
 # Serialize submissions across worker threads so a model-family switch cannot
 # race another prompt between the idle check, cache release and submission.
 _MODEL_SWITCH_LOCK = threading.Lock()
+_DIRECTOR_RUN_LOCK = threading.Lock()
 _ACTIVE_MODEL_FAMILY: str | None = None
 
 
@@ -156,6 +159,20 @@ def api(path: str, body: dict | None = None) -> dict:
 
 def update_run(run_id: str, **fields) -> None:
     change(lambda data: data["runs"][run_id].update(fields))
+
+
+def _serialized_director_run(worker):
+    """Keep director GPU finishing passes separate from later ComfyUI jobs."""
+    @functools.wraps(worker)
+    def wrapped(run_id: str):
+        if _DIRECTOR_RUN_LOCK.locked() and read()["runs"][run_id].get("status") == "queued":
+            update_run(run_id, current="等待上一个导演台任务完成")
+        with _DIRECTOR_RUN_LOCK:
+            if read()["runs"][run_id].get("cancel_requested"):
+                update_run(run_id, status="cancelled", current="已取消", finished_at=time.time())
+                return
+            return worker(run_id)
+    return wrapped
 
 
 def prepare_shot(original: dict, project: dict) -> dict:
@@ -435,7 +452,21 @@ def prepare_shot(original: dict, project: dict) -> dict:
 # 工作流版本：只要 build_h3_graph 的行为变了（新增/移除节点、改变 LoRA 挂载、改变
 # 步数策略等），就把它加一位，让旧成片缓存自动失效——否则同一份镜头设置会命中旧缓存，
 # 把“改完引擎却没重新生成”的旧片段拼回成片。
-WORKFLOW_REVISION = "h3studio_graph_rev_2026_10_21_faceswap_prompt_preset_2"
+WORKFLOW_REVISION = "h3studio_graph_rev_2026_10_22_selflift_refine_audio_keep_face_refine"
+
+
+def shot_refine_mode(shot: dict, project: dict) -> str:
+    """Use a shot override while preserving settings of existing projects."""
+    if project.get("generation_speed") == "goldfish":
+        # This preset already owns its latent enlargement chain in engine.py.
+        return "off"
+    mode = shot.get("refine_mode")
+    return str(project.get("refine_mode") or "off") if mode is None else str(mode)
+
+
+def shot_upscale(shot: dict, project: dict) -> bool:
+    enabled = shot.get("upscale")
+    return bool(project.get("upscale")) if enabled is None else bool(enabled)
 
 
 def _shot_signature(shot: dict, project: dict, assets: dict, previous_signature: str | None = None) -> str:
@@ -445,9 +476,13 @@ def _shot_signature(shot: dict, project: dict, assets: dict, previous_signature:
         "face_refine", "semantic_adapter", "semantic_alpha", "selflift", "selflift_scale",
         "selflift_highres_steps", "selflift_rho", "selflift_tiling", "selflift_tile_count",
         "selflift_tile_overlap", "refine_mode", "refine_steps", "refine_denoise", "refine_passes",
-        "refine_width", "refine_height", "continuous_take", "continuous_render_mode", "continuity_frames", "identity_first_on_switch", "shared_refs", "shared_prompt", "image_descriptions", "clear_vram_between_shots",
+        "refine_width", "refine_height", "refine_transition_step", "refine_lowres_scale",
+        "refine_rho", "refine_w_min", "refine_w_max", "refine_tiling", "refine_upscaler",
+        "output_width", "output_height", "continuous_take", "continuous_render_mode", "continuity_frames", "identity_first_on_switch", "shared_refs", "shared_prompt", "image_descriptions", "clear_vram_between_shots",
     )}
     relevant_project["workflow_revision"] = WORKFLOW_REVISION
+    if project.get("face_refine"):
+        relevant_project["face_refine_revision"] = "multiface_ultrasharp_v2"
     if shot.get("continuity"):
         # Invalidate cached generations after changing the scene-adaptive
         # handoff rules, without invalidating unrelated projects.
@@ -634,7 +669,18 @@ def _strengthen_incoming_identity_reference(shot: dict, incoming_refs: list[str]
         shot["continuity_identity_picture_tag"] = f"<Picture {shot['ref_images'].index(primary) + 1}>"
 
 
-def _copy_asset(asset_id: str, assets: dict, *, trim_start: float | None = None, trim_duration: float | None = None) -> str:
+def _copy_asset(asset_id: str, assets: dict, *, trim_start: float | None = None,
+                trim_duration: float | None = None,
+                fit_width: int | None = None, fit_height: int | None = None) -> str:
+    """Copy an asset into ComfyUI's input folder and return its input filename.
+
+    Videos can be trimmed and fitted to the generation canvas.  H3 carries every
+    reference token through every sampling step and attention cost grows with
+    the square of the token count, so a 720x1280 source video feeding a
+    480x864 canvas costs more attention than the frame being generated.  The
+    reference is therefore downscaled to the canvas (never upscaled) exactly the
+    way ComfyUI's own "match" sizing handles reference images.
+    """
     asset = assets.get(asset_id)
     if not asset:
         raise ValueError(f"素材不存在：{asset_id}")
@@ -642,20 +688,68 @@ def _copy_asset(asset_id: str, assets: dict, *, trim_start: float | None = None,
     if not source.is_file():
         raise FileNotFoundError(source)
     COMFY_INPUT.mkdir(parents=True, exist_ok=True)
-    name = "h3studio_" + asset_id + source.suffix.lower()
-    target = COMFY_INPUT / name
-    if trim_start is not None and asset["kind"] == "video":
-        name = "h3studio_" + asset_id + "_" + str(int(trim_start * 1000)) + "_" + str(int((trim_duration or 0) * 1000)) + ".mp4"
+    is_video = asset["kind"] == "video"
+    wants_trim = is_video and trim_start is not None
+    fitted = None
+    if is_video and fit_width and fit_height and fit_width > 0 and fit_height > 0:
+        source_width, source_height = video_dimensions(source)
+        if source_width and source_height and (source_width > fit_width or source_height > fit_height):
+            ratio = min(fit_width / source_width, fit_height / source_height)
+            # H3 works on a 16px canvas grid, so round the scaled size down to it.
+            fitted = (max(16, int(source_width * ratio) // 16 * 16),
+                      max(16, int(source_height * ratio) // 16 * 16))
+    if wants_trim or fitted:
+        parts = ["h3studio_" + asset_id]
+        if wants_trim:
+            parts += [str(int(trim_start * 1000)), str(int((trim_duration or 0) * 1000))]
+        if fitted:
+            parts.append(f"fit{fitted[0]}x{fitted[1]}")
+        name = "_".join(parts) + ".mp4"
         target = COMFY_INPUT / name
         if not target.exists():
-            command = ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(trim_start), "-i", str(source)]
-            if trim_duration is not None:
-                command += ["-t", str(trim_duration)]
-            command += ["-vf", "fps=24", "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p", "-c:a", "aac", str(target)]
+            command = ["ffmpeg", "-y", "-loglevel", "error"]
+            if wants_trim:
+                command += ["-ss", str(trim_start), "-i", str(source)]
+                if trim_duration is not None:
+                    command += ["-t", str(trim_duration)]
+            else:
+                command += ["-i", str(source)]
+            filters = []
+            if fitted:
+                filters.append(f"scale={fitted[0]}:{fitted[1]}")
+            filters.append("fps=24")
+            command += ["-vf", ",".join(filters), "-c:v", "libx264", "-preset", "fast",
+                        "-pix_fmt", "yuv420p", "-c:a", "aac", str(target)]
             subprocess.run(command, check=True, timeout=300)
-    elif not target.exists() or target.stat().st_size != source.stat().st_size:
+        return name
+    name = "h3studio_" + asset_id + source.suffix.lower()
+    target = COMFY_INPUT / name
+    if not target.exists() or target.stat().st_size != source.stat().st_size:
         shutil.copy2(source, target)
     return name
+
+
+def _canvas_of(settings: dict) -> tuple[int, int]:
+    """The canvas H3 will actually generate (already adjusted by the memory plan)."""
+    try:
+        width, height = int(settings.get("width") or 0), int(settings.get("height") or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+    return (width if width > 0 else 0, height if height > 0 else 0)
+
+
+def _upscale_still_enabled(original: dict, project: dict, project_id: str) -> bool:
+    """Re-read the live SeedVR2 switch while a run waits for upscale confirmation.
+
+    The confirmation panel can be answered by turning the upscale off instead of
+    pressing a button, so the waiting loop must not block forever once the
+    switch is off.  The live project wins over the snapshot taken when the run
+    started.
+    """
+    live_project = read()["projects"].get(project_id) or project
+    live_shot = next((item for item in live_project.get("shots", [])
+                      if item.get("id") == original.get("id")), original)
+    return bool(shot_upscale(live_shot, live_project))
 
 
 def _make_media_map(shot: dict, project: dict, assets: dict) -> dict[str, str]:
@@ -669,12 +763,15 @@ def _make_media_map(shot: dict, project: dict, assets: dict) -> dict[str, str]:
                if isinstance(guide, dict) and guide.get("image_id"))
     for values in project.get("shared_refs", {}).values():
         ids.update(values or [])
-    media = {asset_id: _copy_asset(asset_id, assets) for asset_id in ids}
+    canvas_width, canvas_height = _canvas_of(project)
+    media = {asset_id: _copy_asset(asset_id, assets, fit_width=canvas_width,
+                                   fit_height=canvas_height) for asset_id in ids}
     if shot.get("source_video"):
         media[shot["source_video"]] = _copy_asset(
             shot["source_video"], assets,
             trim_start=float(shot.get("source_start") or 0),
             trim_duration=float(shot.get("duration") or 5),
+            fit_width=canvas_width, fit_height=canvas_height,
         )
     return media
 
@@ -897,6 +994,63 @@ def _seedvr2_enlarges(width: int, height: int, resolution: int, max_resolution: 
     """Both SeedVR2 canvas limits must permit a real enlargement."""
     return min(int(resolution) / min(width, height),
                int(max_resolution) / max(width, height)) > 1.01
+
+
+@_serialized_director_run
+def run_post_upscale(run_id: str) -> None:
+    """Apply SeedVR2 to an existing completed video without running H3 again."""
+    run = read()["runs"][run_id]
+    source = OUTPUTS / run["source_file"]
+    output_dir = OUTPUTS / run_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        update_run(run_id, status="running", started_at=time.time(),
+                   current="读取已有成片 · 不重新生成 H3", progress="0/1")
+        if not source.is_file():
+            raise ValueError("原成片文件已不存在")
+        original_size = _video_dimensions(source)
+        resolution = int(run["upscale_resolution"])
+        max_resolution = int(run["upscale_max_resolution"])
+        if not _seedvr2_enlarges(*original_size, resolution, max_resolution):
+            raise ValueError("当前超分目标尺寸没有高于原片；请在高级设置中提高短边和最长边")
+        input_name = f"h3studio_{run_id}_existing.mp4"
+        shutil.copy2(source, COMFY_INPUT / input_name)
+        prefix = f"h3_studio_{run_id}_seedvr2"
+        graph = build_seedvr2_graph(input_name, prefix, resolution=resolution,
+                                     max_resolution=max_resolution, seed=int(run.get("seed", 42)))
+        prompt_id = _resume_prompt(run_id, "seedvr2_existing", run["source_run_id"])
+        if not prompt_id:
+            prompt_id = _submit(graph, run_id)
+            update_run(run_id, prompt_id=prompt_id, active_stage="seedvr2_existing",
+                       active_shot_id=run["source_run_id"], active_prefix=prefix,
+                       current="对已有成片执行 SeedVR2 超分")
+        output = output_dir / "post_upscaled.mp4"
+        _download_video(_wait(prompt_id, run_id), output, prefix)
+        upscaled_size = _video_dimensions(output)
+        if min(upscaled_size) <= min(original_size):
+            raise RuntimeError("SeedVR2 输出尺寸未超过原片，已保留原成片")
+        # SeedVR2 processes pictures. Keep the original soundtrack on the new video.
+        with_audio = output_dir / "post_upscaled_audio.mp4"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(output),
+                        "-i", str(source), "-map", "0:v:0", "-map", "1:a:0?",
+                        "-c:v", "copy", "-c:a", "aac", "-shortest", str(with_audio)],
+                       check=True, timeout=300)
+        with_audio.replace(output)
+        relative = str(output.relative_to(OUTPUTS))
+        result = {"file": relative, "source_file": run["source_file"]}
+        if run.get("source_shot_id"):
+            result["shot_id"] = run["source_shot_id"]
+        update_run(run_id, status="completed", finished_at=time.time(),
+                   current="已有成片超分完成", progress="1/1", merged=relative,
+                   preview_file=relative, results=[result], active_stage="",
+                   active_shot_id="", active_prefix="", upscale_result={
+                       "source_width": original_size[0], "source_height": original_size[1],
+                       "output_width": upscaled_size[0], "output_height": upscaled_size[1],
+                       "file": relative})
+    except Exception as error:
+        status = "cancelled" if "用户取消任务" in str(error) else "error"
+        update_run(run_id, status=status, error=str(error), finished_at=time.time(),
+                   current="已有成片超分失败", active_stage="", active_shot_id="")
 
 
 def _tail_clip(video: Path, target: Path, frames: int) -> None:
@@ -1572,12 +1726,58 @@ def _write_merge_audio(videos: list[Path], target: Path) -> None:
             subprocess.run(command, stdout=master, check=True, timeout=600)
 
 
+def _fit_output_size(video: Path, output_dir: Path, index: int, project: dict) -> Path:
+    """Rescale the finished shot to the exact delivery size.
+
+    H3's native canvas is 1344x768 (1.75:1), so a 16:9 delivery comes out of
+    the upscaler as 1890x1080 rather than 1920x1080.  This stage scales to
+    cover the target and center-crops the overflow: no letterbox bars, no
+    stretching.  A target of 0 on either side keeps the video as it is.
+    """
+    target_w = int(project.get("output_width") or 0)
+    target_h = int(project.get("output_height") or 0)
+    if target_w <= 0 or target_h <= 0:
+        return video
+    width, height = _video_dimensions(video)
+    if (width, height) == (target_w, target_h):
+        return video
+    fitted = output_dir / f"shot_{index:03d}_fit.mp4"
+    vf = (f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+          f"crop={target_w}:{target_h}:(iw-{target_w})/2:(ih-{target_h})/2,"
+          "setsar=1")
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-threads", "2", "-i", str(video),
+                    "-vf", vf, "-filter_threads", "2", "-c:v", "libx264", "-threads", "2",
+                    "-preset", "fast", "-crf", "17",
+                    "-pix_fmt", "yuv420p", "-c:a", "copy", str(fitted)],
+                   check=True, timeout=900)
+    # 不覆盖原文件：checkpoint 里的「H3 原片」必须还是原始采样结果。
+    return fitted
+
+
 def _merge(videos: list[Path], target: Path, width: int, height: int) -> None:
+    """把分镜拼成一条片。
+
+    画布以素材实际尺寸为准，而不是项目画布：开了超分后每个镜头是
+    1890×1080，若这里再按项目画布（1344×768）缩放，超分的收益会在最后
+    一步被吃掉。
+    """
     normalized = []
-    for index, path in enumerate(videos):
+    sizes = []
+    probed = []
+    for path in videos:
         info = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(path)],
                               capture_output=True, text=True, check=True, timeout=30)
-        has_audio = any(stream.get("codec_type") == "audio" for stream in json.loads(info.stdout).get("streams", []))
+        streams = json.loads(info.stdout).get("streams", [])
+        picture = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+        if picture:
+            sizes.append((int(picture.get("width") or width), int(picture.get("height") or height)))
+        probed.append((path, any(stream.get("codec_type") == "audio" for stream in streams)))
+    if sizes:
+        # 画布以素材实际尺寸为准：开了超分后镜头是 1890×1080，若这里再按项目
+        # 画布（1344×768）缩放，超分的收益会在最后一步被吃掉。
+        width = max(item[0] for item in sizes)
+        height = max(item[1] for item in sizes)
+    for index, (path, has_audio) in enumerate(probed):
         output = target.with_name(f"merge_norm_{index:03d}.mkv")
         command = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path)]
         if not has_audio:
@@ -1761,7 +1961,8 @@ def _native_take_shot(shots: list[dict], project: dict) -> dict | None:
             or project.get("continuous_render_mode", "auto") == "segmented"
             or len(shots) < 2
             or len(shots) != len(project.get("shots", []))
-            or project.get("refine_mode", "off") != "off" or project.get("upscale")
+            or any(shot_refine_mode(shot, project) != "off" or shot_upscale(shot, project)
+                   for shot in shots)
             or project.get("face_refine") or project.get("selflift")):
         return None
     if any(shot.get("mode") != "r2v" or shot.get("source_video")
@@ -1855,6 +2056,7 @@ def _selected_results_for_merge(shots: list[dict], selected_ids: set[str],
             if shot["id"] in selected_ids and shot["id"] in by_id]
 
 
+@_serialized_director_run
 def run_project(run_id: str) -> None:
     """Process selected shots sequentially; keep results even if a later shot fails."""
     state = read()
@@ -1942,10 +2144,11 @@ def run_project(run_id: str) -> None:
                 # handoff window: build_h3_graph requests duration + continuity_frames.
                 shot["_h3_effective_duration"] = _grid_duration(
                     float(shot.get("duration", 5)), shot["continuity_frames"])
-            render_settings = project
+            render_settings = copy.deepcopy(project)
+            render_settings["refine_mode"] = shot_refine_mode(original, project)
+            render_settings["_h3_has_continuity"] = bool(original.get("continuity_video"))
             if project.get("memory_policy") == "auto_vram":
                 memory_plan = _auto_memory_plan(int(project.get("width", 1024)), int(project.get("height", 576)))
-                render_settings = copy.deepcopy(project)
                 render_settings["width"], render_settings["height"] = memory_plan["width"], memory_plan["height"]
                 if render_settings.get("refine_mode") in ("latent", "latent_only"):
                     requested_refine = (int(project.get("refine_width") or memory_plan["width"]),
@@ -1977,7 +2180,7 @@ def run_project(run_id: str) -> None:
                            current=shot["name"] + " · 已复用缓存", reused_shot_ids=reused_shot_ids)
                 continue
             update_run(run_id, current=shot["name"] + " · 准备生成", progress=f"{index}/{len(shots)}")
-            media = _make_media_map(shot, project, assets)
+            media = _make_media_map(shot, render_settings, assets)
             if previous and shot.get("continuity"):
                 context_frames = int(shot.get("continuity_frames", 22))
                 guide_frames = int(shot.get("continuity_guide_frames") or _continuity_anchor_frames(context_frames))
@@ -1994,23 +2197,36 @@ def run_project(run_id: str) -> None:
             checkpoint = checkpoints.get(shot["id"], {})
             first_pass = OUTPUTS / checkpoint.get("h3_file", "")
             pre_refine = OUTPUTS / checkpoint["pre_refine_file"] if checkpoint.get("pre_refine_file") else None
+            # 采样计划先算好：界面写着 8 步、实际跑 4 步这种事必须一眼可见。
+            try:
+                from engine import sampler_summary
+                sampler_info = sampler_summary(render_settings, shot.get("mode", "t2v"))
+                sampler_label = sampler_info["label"]
+            except Exception:
+                sampler_info, sampler_label = None, ""
             if checkpoint.get("signature") != signature or not first_pass.is_file() or (pre_refine and not pre_refine.is_file()):
                 prompt_id = _resume_prompt(run_id, "h3", shot["id"])
                 if not prompt_id:
                     graph = build_h3_graph(shot, render_settings, media, prefix)
+                    if sampler_info:
+                        try:
+                            update_run(run_id, sampler=sampler_info)
+                        except Exception:  # 摘要失败不能影响渲染
+                            pass
                     if read()["runs"][run_id].get("cancel_requested"):
                         raise RuntimeError("用户取消任务")
                     prompt_id = _submit(graph, run_id)
                     update_run(run_id, prompt_id=prompt_id, active_stage="h3",
                                active_shot_id=shot["id"], active_prefix=prefix,
-                               current=shot["name"] + " · H3 视频生成中")
+                               current=shot["name"] + " · H3 视频生成中"
+                               + (f"（{sampler_label}）" if sampler_label else ""))
                 else:
                     update_run(run_id, current=shot["name"] + " · 恢复 ComfyUI H3 任务")
                 first_pass = output_dir / f"shot_{index:03d}_h3.mp4"
                 history = _wait(prompt_id, run_id)
                 _download_video(history, first_pass, prefix)
                 pre_refine = None
-                if project.get("refine_mode") in ("same", "latent", "latent_only"):
+                if render_settings.get("refine_mode") in ("same", "latent", "latent_only"):
                     pre_refine = output_dir / f"shot_{index:03d}_pre_refine.mp4"
                     _download_video(history, pre_refine, prefix + "_pre")
                 if read()["runs"][run_id].get("cancel_requested"):
@@ -2021,12 +2237,6 @@ def run_project(run_id: str) -> None:
                     if pre_refine:
                         _trim_downloaded_shot(pre_refine, shot, previous)
                 shot["_h3_entry_flash"] = _suppress_entry_flash(first_pass)
-                if project.get("face_refine"):
-                    refined = output_dir / f"shot_{index:03d}_face.mp4"
-                    face_python = os.environ.get("H3_STUDIO_FACE_PYTHON", "/home/administrator/ComfyUI/venv/bin/python")
-                    subprocess.run([face_python, str(Path(__file__).with_name("face_refine.py")),
-                                    str(first_pass), str(refined)], check=True, timeout=3600)
-                    refined.replace(first_pass)
                 checkpoint = {"signature": signature, "h3_file": str(first_pass.relative_to(OUTPUTS)),
                               "pre_refine_file": str(pre_refine.relative_to(OUTPUTS)) if pre_refine else None}
                 def save_checkpoint(data):
@@ -2036,7 +2246,7 @@ def run_project(run_id: str) -> None:
             update_run(run_id, preview_file=str(first_pass.relative_to(OUTPUTS)),
                        pre_refine_file=str(pre_refine.relative_to(OUTPUTS)) if pre_refine else None)
             final = first_pass
-            perform_upscale = bool(project.get("upscale"))
+            perform_upscale = shot_upscale(original, project)
             if perform_upscale:
                 original_size = _video_dimensions(first_pass)
                 if not _seedvr2_enlarges(*original_size,
@@ -2058,6 +2268,13 @@ def run_project(run_id: str) -> None:
                         if decision.get("cancel_requested"):
                             raise RuntimeError("用户取消任务")
                         if decision.get("upscale_approved") or decision.get("skip_upscale"):
+                            break
+                        # 超分可能在等待确认期间被关掉。这时不该继续拦着用户点确认，
+                        # 直接按"跳过超分"处理，继续跑后面的镜头。
+                        if not _upscale_still_enabled(original, project, run["project_id"]):
+                            decision = {"skip_upscale": True}
+                            update_run(run_id, skip_upscale=True, upscale_skipped_reason=(
+                                "超分已在等待确认期间关闭，自动跳过超分。"))
                             break
                         time.sleep(1)
                     update_run(run_id, status="running")
@@ -2081,7 +2298,7 @@ def run_project(run_id: str) -> None:
                     else:
                         update_run(run_id, current=shot["name"] + " · 恢复 ComfyUI SeedVR2 任务")
                     final = output_dir / f"shot_{index:03d}_seedvr2.mp4"
-                    _download_video(_wait(prompt_id, run_id), final)
+                    _download_video(_wait(prompt_id, run_id), final, prefix + "_seedvr2")
                     upscaled_size = _video_dimensions(final)
                     if min(upscaled_size) <= min(original_size):
                         raise RuntimeError(
@@ -2098,6 +2315,17 @@ def run_project(run_id: str) -> None:
                     update_run(run_id, active_stage="", active_shot_id="", active_prefix="")
                     if read()["runs"][run_id].get("cancel_requested"):
                         raise RuntimeError("用户取消任务")
+            # 先裁到交付尺寸，再在人脸恢复：这样脸部检测和细节恢复都作用在
+            # 最终分辨率上（1080p 下脸约 194px，4K 下约 388px）。
+            final = _fit_output_size(final, output_dir, index, project)
+            if project.get("face_refine"):
+                refined = output_dir / f"shot_{index:03d}_face.mp4"
+                face_python = os.environ.get("H3_STUDIO_FACE_PYTHON", "/home/administrator/ComfyUI/venv/bin/python")
+                env = dict(os.environ)
+                env["H3_STUDIO_FACE_USE_ESRGAN"] = "1"
+                subprocess.run([face_python, str(Path(__file__).with_name("face_refine.py")),
+                                str(final), str(refined)], check=True, timeout=3600, env=env)
+                refined.replace(final)
             source = COMFY_INPUT / media[shot["source_video"]] if shot.get("source_video") else None
             _audio_mode(final, source, shot.get("audio_mode", "generate"))
             previous = final
