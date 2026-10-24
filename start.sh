@@ -43,7 +43,7 @@ stop_studio_listener() {
 }
 
 studio_version="$(curl --noproxy '*' -fsS --max-time 3 "$studio_url/api/version" 2>/dev/null || true)"
-if [[ -n "$studio_version" && "$studio_version" != *"independent-91"* ]]; then
+if [[ -n "$studio_version" && "$studio_version" != *"independent-92"* ]]; then
     echo "正在关闭旧版工作台…"
     stop_studio_listener
     for attempt in $(seq 1 20); do

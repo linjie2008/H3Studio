@@ -70,27 +70,54 @@ KREA2_NODES = ("Krea2EditGroundedEncode", "Krea2EditModelPatch", "ImageResizeKJv
 XB_NODE = "XB_QwenPromptPreset"
 XB_TEXT_ENCODER = "qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot.safetensors"
 GREEN_BG_NODE = "easy imageRemBg"
-XB_I2I_WORKFLOW = (Path(os.environ.get("COMFYUI_DIR", "/home/administrator/ComfyUI")) /
-                   "user/default/workflows/Qwen-Image/2.1/图片编辑/"
-                   "Qwen-Image-2.1_69-图片编辑进阶工作流-本机适配.json")
-_SIX_VIEW_WORKFLOW_CANDIDATES = tuple(
-    Path(os.environ.get("COMFYUI_DIR", "/home/administrator/ComfyUI")) / relative
-    for relative in (
-        # Current location inside the Qwen-Image category folder.
-        "user/default/workflows/Qwen-Image/2.1/"
-        "qwen-image2.1_人物定装照四视图_六视图.json",
-        # Legacy location at the workflows root.
-        "user/default/workflows/qwen-image2.1_人物定装照四视图_六视图.json",
-    ))
-SIX_VIEW_WORKFLOW = next((path for path in _SIX_VIEW_WORKFLOW_CANDIDATES if path.is_file()),
-                         _SIX_VIEW_WORKFLOW_CANDIDATES[0])
+COMFY_WORKFLOWS = (Path(os.environ.get("COMFYUI_DIR", "/home/administrator/ComfyUI")) /
+                   "user/default/workflows")
+_XB_I2I_RELATIVE = ("Qwen-Image/2.1/图片编辑/"
+                    "Qwen-Image-2.1_69-图片编辑进阶工作流-本机适配.json",)
+_SIX_VIEW_RELATIVE = (
+    # Current location inside the Qwen-Image category folder.
+    "Qwen-Image/2.1/qwen-image2.1_人物定装照四视图_六视图.json",
+    # Legacy location at the workflows root.
+    "qwen-image2.1_人物定装照四视图_六视图.json",
+)
+_SIX_VIEW_WORKFLOW_CANDIDATES = tuple(COMFY_WORKFLOWS / relative
+                                      for relative in _SIX_VIEW_RELATIVE)
+
+
+def _resolve_workflow(relatives, root: Path | None = None) -> Path | None:
+    """Locate a ComfyUI workflow even after its category folder is renamed.
+
+    Exact relative paths win; otherwise the workflows tree is searched by file
+    name. ComfyUI users routinely rename or reorder the sidebar folders (here
+    ``Qwen-Image`` became ``2 Qwen-Image``), which used to leave the character
+    sheet feature pointing at a file that no longer existed.
+    """
+    base = root or COMFY_WORKFLOWS
+    for relative in relatives:
+        candidate = base / relative
+        if candidate.is_file():
+            return candidate
+    if not base.is_dir():
+        return None
+    name = Path(relatives[-1]).name
+    matches = [path for path in base.rglob(name) if path.is_file()]
+    return min(matches, key=lambda path: (len(path.parts), str(path))) if matches else None
+
+
+SIX_VIEW_WORKFLOW = (_resolve_workflow(_SIX_VIEW_RELATIVE) or
+                     COMFY_WORKFLOWS / _SIX_VIEW_RELATIVE[0])
+XB_I2I_WORKFLOW = (_resolve_workflow(_XB_I2I_RELATIVE) or
+                   COMFY_WORKFLOWS / _XB_I2I_RELATIVE[0])
 SIX_VIEW_MODEL = "qwen_image_2.1_int8_convrot.safetensors"
 
 
 def _xb_i2i_workflow_defaults() -> dict:
     """Read the user's saved XB node settings from their workflow 69."""
+    workflow_path = _resolve_workflow(_XB_I2I_RELATIVE)
+    if workflow_path is None:
+        return {}
     try:
-        workflow = json.loads(XB_I2I_WORKFLOW.read_text(encoding="utf-8"))
+        workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
         node = next(item for item in workflow.get("nodes", [])
                     if item.get("type") == XB_NODE)
         values = node.get("widgets_values") or []
@@ -464,8 +491,8 @@ def build_six_view_sheet_graph(source_name: str | None, job_id: str,
     if not source_name:
         raise ValueError("六视图定装照需要先绑定人物原图")
     try:
-        workflow_path = SIX_VIEW_WORKFLOW if SIX_VIEW_WORKFLOW.is_file() else next(
-            (path for path in _SIX_VIEW_WORKFLOW_CANDIDATES if path.is_file()), SIX_VIEW_WORKFLOW)
+        workflow_path = SIX_VIEW_WORKFLOW if SIX_VIEW_WORKFLOW.is_file() else (
+            _resolve_workflow(_SIX_VIEW_RELATIVE) or SIX_VIEW_WORKFLOW)
         workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
         nodes = {node["id"]: node for node in workflow["nodes"]}
         template = str(nodes[21]["widgets_values"][0]).strip()
