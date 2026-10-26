@@ -10,7 +10,8 @@ class LivePreviewSubmitTests(unittest.TestCase):
     def test_submit_enables_per_prompt_preview_without_server_restart(self):
         graph = {"1": {"class_type": "SamplerCustomAdvanced", "inputs": {}}}
         family = runner._graph_model_family(graph)
-        with patch.object(runner, "_ACTIVE_MODEL_FAMILY", family), patch.object(
+        with patch.object(runner, "_ACTIVE_MODEL_RUN_ID", "run123"), \
+             patch.object(runner, "_ACTIVE_MODEL_FAMILY", family), patch.object(
             runner, "api", return_value={"prompt_id": "preview-test"}
         ) as api, patch.object(runner, "update_run") as update_run:
             self.assertEqual(runner._submit(graph, "run123"), "preview-test")

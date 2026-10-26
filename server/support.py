@@ -12,6 +12,7 @@ from prompt_tools import deepseek_last_completion
 from multiview import generate as generate_multiview
 import hashlib
 import json
+import re
 import threading
 from store import read
 import time
@@ -183,6 +184,14 @@ def enhancement_references(prepared: dict, project: dict, catalog: dict,
                 "name": str(asset.get("name") or asset_id)[:160], "role": str(role)[:80],
                 "description": str((project.get("image_descriptions") or {}).get(asset_id) or "")[:600]
                     if kind == "image" else ""})
+            if kind == "video":
+                references[-1].update(
+                    is_source=asset_id == prepared.get("source_video"),
+                    source_kind=("depth" if re.search(r"(?:^|[_\W])depth(?:[_\W]|$)|深度",
+                                                      str(asset.get("name") or ""), re.I) else "video"))
+                if asset_id == prepared.get("source_video"):
+                    references[-1].update(source_start_seconds=float(prepared.get("source_start") or 0),
+                                          source_duration_seconds=float(prepared.get("duration") or 5))
     return references
 
 def make_multiview_job(state: dict, project_id: str, character_id: str, body: dict) -> dict:

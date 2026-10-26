@@ -4,6 +4,19 @@ from engine import build_h3_graph
 
 
 class EngineAttentionTests(unittest.TestCase):
+    def test_shared_identity_contract_survives_a_generic_segment_prompt(self):
+        graph = build_h3_graph(
+            {"mode": "rv2v", "source_video": "source", "ref_images": ["character"],
+             "replace_person": False, "duration": 5,
+             "prompt": "全片土拨鼠的毛色、花纹、门齿与体型一律以身份参考图为准。\n"
+                       "Improve the final shot's detail. <Picture 1>"},
+            {"width": 480, "height": 864, "generation_speed": "turbo"},
+            {"source": "source.mp4", "character": "character.png"}, "shared_identity",
+        )
+        loras = [node["inputs"]["lora_name"] for node in graph.values()
+                 if node["class_type"] == "LoraLoaderModelOnly"]
+        self.assertIn("minimax_h3/h3_character_swap_pro4500_1000.safetensors", loras)
+
     def test_four_step_preset_uses_matching_creative_lora(self):
         graph = build_h3_graph(
             {"mode": "fl2v", "prompt": "A person walks toward the camera.",

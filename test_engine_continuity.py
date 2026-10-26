@@ -1,17 +1,61 @@
 import unittest
+import tempfile
+import subprocess
 from pathlib import Path
 
 from engine import build_h3_graph, compile_shot_prompt, lint_shot_prompt
-from runner import (prepare_shot, _continuity_policy, _continuity_subject_relation, _handoff_window,
+from runner import (prepare_shot, _continuity_policy, _continuity_subject_relation, _identity_handoff_changed, _handoff_window,
                     _continuity_anchor_frames,
                     _strengthen_incoming_identity_reference, _shot_identity_refs,
                     _select_handoff_tail_trim, _select_handoff_alignment,
                     _smooth_handoff_motion, _match_handoff_exposure,
                     _stable_matching_view, _append_merge_item)
+import runner
 from unittest.mock import patch
 
 
 class EngineContinuityTests(unittest.TestCase):
+    def test_small_exposure_flash_is_matched_without_changing_clip_length(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            previous, current = output / "before.mp4", output / "after.mp4"
+            for path, offset in [(previous, 0), (current, 1)]:
+                source = ("nullsrc=size=96x160:rate=24,"
+                          f"geq=lum='if(lt(X,W/2),{60 + offset},{160 + offset})':cb=128:cr=128")
+                subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", source,
+                                "-frames:v", "24", "-c:v", "libx264", "-crf", "0", str(path)],
+                               check=True)
+            matched = output / "matched.mp4"
+            before, after, gain = runner._match_handoff_exposure(previous, current, matched)
+            self.assertIsNotNone(gain)
+            self.assertLess(after, before)
+            frames = runner._handoff_gray_frames(matched)
+            reference = runner._handoff_gray_frames(previous)[-1]
+            self.assertEqual(len(frames), 24)
+            self.assertLess(abs(sum(frames[0]) - sum(reference)) / len(reference), 0.25)
+            self.assertGreater(abs(sum(frames[-1]) - sum(reference)) / len(reference), 0.75)
+
+    def test_delivery_crop_does_not_become_next_shots_guide(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            native = output / "native.mp4"
+            subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                            "testsrc2=size=96x160:rate=24", "-frames:v", "6",
+                            "-c:v", "libx264", str(native)], check=True)
+            fitted = runner._fit_output_size(native, output, 0,
+                                              {"output_width": 108, "output_height": 192})
+            item = {"file": fitted.name, "h3_file": native.name}
+            with patch.object(runner, "OUTPUTS", output):
+                # Saved runs and rerolls must also recover the uncropped source.
+                source = runner._continuity_source(item)
+                guide = output / "guide.mp4"
+                runner._tail_clip(source, guide, 5)
+                self.assertEqual(runner._video_dimensions(guide), (96, 160))
+                self.assertEqual(runner._video_dimensions(fitted), (108, 192))
+                # An enhanced canvas, when present, takes precedence over H3.
+                item["continuity_file"] = guide.name
+                self.assertEqual(runner._continuity_source(item), guide)
+
     def test_t2v_ignores_stale_frame_selections(self):
         graph = build_h3_graph(
             {"mode": "t2v", "prompt": "A traveler crosses a market.", "duration": 5,
@@ -104,6 +148,32 @@ class EngineContinuityTests(unittest.TestCase):
         _strengthen_incoming_identity_reference(second, current_refs)
         self.assertEqual(second["continuity_identity_picture_tag"], "<Picture 2>")
         self.assertEqual(second["ref_image_roles"], {"pilot_b": "fully_preserved"})
+
+    def test_shared_aircraft_near_person_word_does_not_hide_new_pilot(self):
+        project = {"reference_image_numbers": {"runway": 1, "aircraft": 2,
+                                                "pilot_a": 3, "pilot_b": 4},
+                   "image_descriptions": {"aircraft": "One olive-green biplane and open cockpit"},
+                   "characters": [], "shots": []}
+        assets = {"runway": {"name": "战时机场场景"},
+                  "aircraft": {"name": "aircraft.png"},
+                  "pilot_a": {"name": "甲飞行员四视图"},
+                  "pilot_b": {"name": "乙飞行员四视图"}}
+        first = {"prompt": "人物从 <Picture 3> 来，<Picture 2> 是飞机。"}
+        second = {"prompt": "人物身份只绑定 <Picture 4>，<Picture 2> 只提供飞机外形；"
+                            "这张脸与上一段明显不是同一个人。"}
+        project["shots"] = [first, second]
+        previous_refs = _shot_identity_refs(first, project, assets)
+        current_refs = _shot_identity_refs(second, project, assets)
+        self.assertEqual(previous_refs, ["pilot_a"])
+        self.assertEqual(current_refs, ["pilot_b"])
+        self.assertEqual(_continuity_subject_relation(previous_refs, current_refs), "new")
+        self.assertTrue(_identity_handoff_changed(previous_refs, current_refs))
+        self.assertFalse(_identity_handoff_changed(["pilot_a"], ["pilot_a"]))
+        continuation = _continuity_policy({"continuous_take": True, "continuity_frames": 39},
+                                          second, 1)
+        self.assertTrue(continuation["enabled"])
+        context, visible = _handoff_window("new", continuation["frames"])
+        self.assertEqual((context, visible, _continuity_anchor_frames(context)), (8, 4, 5))
 
     def test_gallery_only_image_does_not_become_continuity_identity(self):
         project = {"reference_image_numbers": {"pilot": 1}, "characters": [], "shots": []}

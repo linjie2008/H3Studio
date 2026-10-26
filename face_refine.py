@@ -17,6 +17,11 @@ import sys
 from pathlib import Path
 from typing import Tuple
 
+# Face restoration runs after H3 and shares the desktop GPU with ComfyUI.
+# Keep its CPU fallback bounded even when BLAS inherits a larger thread pool.
+for _threads_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ[_threads_var] = os.environ.get("H3_STUDIO_FACE_CPU_THREADS", "2")
+
 import numpy as np
 
 try:
@@ -46,6 +51,29 @@ ESRGAN_ENABLED = os.environ.get("H3_STUDIO_FACE_USE_ESRGAN", "0") == "1"
 _ESRGAN = {"model": None, "device": None}
 
 
+def _face_device() -> str:
+    """Keep background restoration off the GPU unless explicitly requested."""
+    choice = os.environ.get("H3_STUDIO_FACE_DEVICE", "cpu").strip().lower()
+    if choice in ("cpu", "cuda"):
+        return choice
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, check=True, timeout=5)
+        free_mib = int(result.stdout.splitlines()[0].strip())
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        print("[face_refine] 无法确认显存余量，使用 CPU", flush=True)
+        return "cpu"
+    # Explicit auto mode is optional. An initially empty GPU can still be
+    # filled by repeated full-resolution face inference, so CPU is the default.
+    device = "cuda" if free_mib >= 12 * 1024 else "cpu"
+    print(f"[face_refine] 启动时显存空闲 {free_mib} MiB，使用 {device.upper()}", flush=True)
+    return device
+
+
+FACE_DEVICE = _face_device()
+
+
 def _load_esrgan():
     if not ESRGAN_ENABLED:
         return None
@@ -63,7 +91,7 @@ def _load_esrgan():
         from spandrel import ModelLoader
         descriptor = ModelLoader().load_from_state_dict(
             comfy.utils.load_torch_file(path, safe_load=True))
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = FACE_DEVICE if FACE_DEVICE == "cpu" or torch.cuda.is_available() else "cpu"
         model = descriptor.model.to(device).eval()
         _ESRGAN["model"] = (model, torch, device)
         print(f"[face_refine] 超分模型已加载：{Path(path).name} ({device})", flush=True)
@@ -122,14 +150,16 @@ class TemporalFaceTracker:
             except Exception as e:
                 self.yolo = None
 
-        # 2. Try InsightFace on CUDA
+        # 2. Try InsightFace on the selected device
         if self.yolo is None:
             try:
                 from insightface.app import FaceAnalysis
-                app = FaceAnalysis(name="buffalo_l", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-                app.prepare(ctx_id=0, det_size=(640, 640))
+                providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                             if FACE_DEVICE == "cuda" else ["CPUExecutionProvider"])
+                app = FaceAnalysis(name="buffalo_l", providers=providers)
+                app.prepare(ctx_id=0 if FACE_DEVICE == "cuda" else -1, det_size=(640, 640))
                 self.app = app
-                self.backend = "insightface_cuda"
+                self.backend = "insightface_" + FACE_DEVICE
             except Exception as exc:
                 try:
                     from insightface.app import FaceAnalysis
@@ -150,7 +180,8 @@ class TemporalFaceTracker:
             try:
                 # A larger inference canvas preserves faces occupying only a
                 # small part of a wide shot. Keep every detection, not just one.
-                results = self.yolo(frame_bgr, verbose=False, conf=0.25, imgsz=1280)
+                results = self.yolo(frame_bgr, verbose=False, conf=0.25,
+                                    imgsz=1280, device=FACE_DEVICE)
                 boxes = []
                 for r in results:
                     for b in r.boxes.xyxy.cpu().numpy():

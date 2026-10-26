@@ -3,7 +3,6 @@
 import json
 import os
 import re
-import select
 import subprocess
 import threading
 import urllib.error
@@ -283,12 +282,10 @@ def _translation_markers(text: str) -> Counter:
 
 
 _LOCAL_TRANSLATION_LOCK = threading.Lock()
-_LOCAL_TRANSLATION_PROCESS = None
 
 
 def _local_translation(prompt: str, target_language: str = "zh") -> str | None:
-    """Translate with a warm CPU-only Qwen3 worker when installed."""
-    global _LOCAL_TRANSLATION_PROCESS
+    """Run one CPU-only translation and release its model before returning."""
     root = Path(__file__).resolve().parent
     interpreter = root / ".venv-translation" / "bin" / "python"
     runner = root / "local_translation.py"
@@ -297,28 +294,20 @@ def _local_translation(prompt: str, target_language: str = "zh") -> str | None:
         return None
     with _LOCAL_TRANSLATION_LOCK:
         try:
-            if _LOCAL_TRANSLATION_PROCESS is None or _LOCAL_TRANSLATION_PROCESS.poll() is not None:
-                _LOCAL_TRANSLATION_PROCESS = subprocess.Popen(
-                    [str(interpreter), str(runner), "--worker"],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL, text=True, bufsize=1,
-                    env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
-                )
-            worker = _LOCAL_TRANSLATION_PROCESS
-            worker.stdin.write(json.dumps({"text": prompt, "target_language": target_language}, ensure_ascii=False) + "\n")
-            worker.stdin.flush()
-            if not select.select([worker.stdout], [], [], 180)[0]:
-                raise TimeoutError("本地翻译超时")
-            response = json.loads(worker.stdout.readline())
+            completed = subprocess.run(
+                [str(interpreter), str(runner), "--worker"],
+                input=json.dumps({"text": prompt, "target_language": target_language}, ensure_ascii=False) + "\n",
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                timeout=180, check=True,
+                env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+            )
+            response = json.loads(completed.stdout)
             translation = response.get("translation", "")
             if (not translation or response.get("error") or
                     _translation_markers(prompt) != _translation_markers(translation)):
                 raise RuntimeError(response.get("error") or "本地译文的参考标记或时间段发生变化")
             return translation
-        except (OSError, ValueError, RuntimeError, TimeoutError, BrokenPipeError):
-            if _LOCAL_TRANSLATION_PROCESS is not None:
-                _LOCAL_TRANSLATION_PROCESS.kill()
-                _LOCAL_TRANSLATION_PROCESS = None
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
             return None
 
 

@@ -92,6 +92,7 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertEqual(graph["3"]["inputs"]["unet_name"],
                          "qwen_image_2.1_int8_convrot.safetensors")
         self.assertEqual(graph["9"]["inputs"]["steps"], 40)
+        self.assertTrue(graph["7"]["inputs"]["skip_negative"])
         self.assertEqual(graph["7"]["inputs"]["images.image_1"], ["2", 0])
         self.assertIn("2行×3列", graph["7"]["inputs"]["prompt"])
         self.assertIn("灰色军装", graph["7"]["inputs"]["prompt"])
@@ -166,6 +167,7 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertEqual(graph["4"]["inputs"]["prompt"], ["100", 0])
         self.assertEqual(graph["5"]["inputs"]["latent_image"], ["100", 1])
         self.assertEqual(graph["5"]["inputs"]["steps"], 25)
+        self.assertTrue(graph["4"]["inputs"]["skip_negative"])
         self.assertNotIn("green screen", graph["100"]["inputs"]["internal_prompt"])
         self.assertEqual(graph["7"]["inputs"]["images"], ["202", 0])
         self.assertEqual(graph["203"]["inputs"]["image"], ["6", 0])
@@ -216,7 +218,7 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertEqual(graph["100"]["inputs"]["preset_mode"], "人物五视图")
         self.assertEqual(graph["100"]["inputs"]["three_view_text"], "用户保存的 XB 预设设定词")
 
-    def test_xb_qwen_image_mode_uses_workflow_defaults(self):
+    def test_xb_qwen_image_mode_uses_landscape_sheet_canvas(self):
         settings = {"aspect_ratio": "16:9", "width": 1024, "height": 1024,
                     "sampling_mode": "on"}
         workflow = {"aspect_ratio": "4:3", "width": 1024, "height": 768}
@@ -226,17 +228,19 @@ class ProfileImageGraphTests(unittest.TestCase):
             graph = multiview.build_graph(
                 "portrait.png", "fast", "xb", "角色", "four", "xb_qwen", settings)
         self.assertEqual(graph["100"]["inputs"]["io_mode"], "图生图")
-        self.assertEqual(graph["100"]["inputs"]["images"], ["9", 0])
+        self.assertEqual(graph["100"]["inputs"]["images"], ["10", 0])
         self.assertEqual(graph["9"]["inputs"]["image"], "portrait.png")
-        self.assertEqual(graph["100"]["inputs"]["aspect_ratio"], workflow["aspect_ratio"])
-        self.assertEqual(graph["100"]["inputs"]["width"], workflow["width"])
-        self.assertEqual(graph["100"]["inputs"]["height"], workflow["height"])
+        self.assertEqual(graph["100"]["inputs"]["aspect_ratio"], "Free")
+        self.assertEqual(graph["100"]["inputs"]["width"], 1536)
+        self.assertEqual(graph["100"]["inputs"]["height"], 1024)
+        self.assertEqual((graph["10"]["inputs"]["width"], graph["10"]["inputs"]["height"]), (1536, 1024))
         self.assertEqual(graph["100"]["inputs"]["sampling_mode"], "on")
         self.assertEqual(graph["100"]["inputs"]["preset_mode"], "人物四视图")
         self.assertIn("four vertical panels", graph["100"]["inputs"]["three_view_text"])
         self.assertNotIn("headless", graph["100"]["inputs"]["three_view_text"])
         self.assertIn("角色", graph["100"]["inputs"]["internal_prompt"])
-        self.assertEqual(graph["4"]["inputs"]["images.image_1"], ["9", 0])
+        self.assertEqual(graph["4"]["inputs"]["images.image_1"], ["10", 0])
+        self.assertEqual(graph["4"]["inputs"]["resolution"], 0)
         self.assertNotIn("images.image_2", graph["4"]["inputs"])
         self.assertEqual(graph["199"]["inputs"]["image"], ["6", 0])
         self.assertEqual(graph["201"]["inputs"]["width"], ["199", 1])
@@ -292,7 +296,8 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertEqual(graph["100"]["inputs"]["preset_mode"], "人物五视图")
         self.assertIn("exactly five equal-width vertical panels",
                       graph["100"]["inputs"]["three_view_text"])
-        self.assertEqual(graph["4"]["inputs"]["images.image_1"], ["9", 0])
+        self.assertEqual(graph["4"]["inputs"]["images.image_1"], ["10", 0])
+        self.assertEqual((graph["10"]["inputs"]["width"], graph["10"]["inputs"]["height"]), (2048, 1024))
 
     def test_xb_qwen_i2i_uses_explicit_character_canvas(self):
         settings = {"canvas_override": True, "aspect_ratio": "Free",

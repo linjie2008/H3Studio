@@ -253,7 +253,7 @@ def build_qwen_graph(source_name: str | None, preset: str, job_id: str,
             "clip": ["2", 0],
             "vae": ["3", 0], "prompt": prompt,
             "negative_prompt": ANIMAL_NEGATIVE if form == "animal" else NEGATIVE,
-            "resolution": 0}},
+            "resolution": 0, "skip_negative": True}},
         "7": {"class_type": "KSampler", "inputs": {
             "model": ["1", 0], "positive": ["6", 0], "negative": ["6", 1],
             "latent_image": ["6", 2], "seed": secrets.randbits(48),
@@ -382,6 +382,9 @@ def build_xb_qwen_graph(source_name: str | None, preset: str, job_id: str,
             for key in ("aspect_ratio", "width", "height"):
                 if key in options:
                     config[key] = options[key]
+        else:
+            _, sheet_width, sheet_height = _sheet_prompt(None, view_layout)
+            config.update(aspect_ratio="Free", width=sheet_width, height=sheet_height)
     language = "英文 [EN]" if config.get("output_lang") == "en" else "中文 [ZH]"
     sampling_mode = config.get("sampling_mode") if config.get("sampling_mode") in ("bypass", "on", "off") else "bypass"
     skill_mode = config.get("skill_mode") if config.get("skill_mode") in ("自动", "不用") else "自动"
@@ -440,7 +443,7 @@ def build_xb_qwen_graph(source_name: str | None, preset: str, job_id: str,
         "4": {"class_type": "TextEncodeQwenImage21", "inputs": {
             "clip": ["2", 0], "prompt": ["100", 0],
             "negative_prompt": ANIMAL_NEGATIVE if form == "animal" else NEGATIVE,
-            "resolution": max(width, height)}},
+            "resolution": max(width, height), "skip_negative": True}},
         "5": {"class_type": "KSampler", "inputs": {
             "model": ["1", 0], "positive": ["4", 0], "negative": ["4", 1],
             "latent_image": ["100", 1], "seed": seed,
@@ -454,21 +457,16 @@ def build_xb_qwen_graph(source_name: str | None, preset: str, job_id: str,
         # Match workflow 69: the source portrait is the encoder's first and
         # only reference image. The optional green matte runs after decode.
         graph["9"] = {"class_type": "LoadImage", "inputs": {"image": source_name}}
-        reference_image = ["9", 0]
-        if options.get("canvas_override"):
-            # TextEncodeQwenImage21 creates the sampler's latent from its first
-            # reference image, not from XB node 100's empty latent. Its normal
-            # resolution setting retains the source image's aspect ratio, so
-            # changing only XB width/height cannot alter an i2i output canvas.
-            # Pad without stretching/cropping the character and keep the exact
-            # requested dimensions through the encoder (resolution=0).
-            graph["10"] = {"class_type": "ImageResizeKJv2", "inputs": {
-                "image": ["9", 0], "width": width, "height": height,
-                "upscale_method": "lanczos", "keep_proportion": "pad",
-                "pad_color": "0, 255, 0", "crop_position": "center",
-                "divisible_by": 1, "device": "cpu"}}
-            reference_image = ["10", 0]
-            graph["4"]["inputs"]["resolution"] = 0
+        # The encoder derives the output latent from the first image. Pad to
+        # the sheet canvas so a square portrait does not become a giant square
+        # four-view render. The character itself keeps its original proportions.
+        graph["10"] = {"class_type": "ImageResizeKJv2", "inputs": {
+            "image": ["9", 0], "width": width, "height": height,
+            "upscale_method": "lanczos", "keep_proportion": "pad",
+            "pad_color": "0, 255, 0", "crop_position": "center",
+            "divisible_by": 1, "device": "cpu"}}
+        reference_image = ["10", 0]
+        graph["4"]["inputs"]["resolution"] = 0
         graph["100"]["inputs"]["images"] = reference_image
         graph["4"]["inputs"].update({
             "vae": ["3", 0], "images.image_1": reference_image})
@@ -528,7 +526,7 @@ def build_six_view_sheet_graph(source_name: str | None, job_id: str,
             "clip": ["5", 0], "images.image_1": ["2", 0], "vae": ["6", 0],
             "prompt": prompt,
             "negative_prompt": ANIMAL_NEGATIVE if form == "animal" else "",
-            "resolution": resolution}},
+            "resolution": resolution, "skip_negative": True}},
         "8": {"class_type": "EmptyLatentImage", "inputs": {"width": 1536, "height": 2048, "batch_size": 1}},
         "9": {"class_type": "KSampler", "inputs": {
             "model": ["4", 0], "positive": ["7", 0], "negative": ["7", 1],

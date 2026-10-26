@@ -12,6 +12,26 @@ from prompt_skills import load_skill_context
 
 
 class SourceVideoBackgroundTests(unittest.TestCase):
+    def test_depth_source_does_not_supply_black_sky_or_lighting(self):
+        shot = {"mode": "rv2v", "source_video": "source", "replace_person": True,
+                "ref_images": ["person"],
+                "_h3_reference_names": {"source": "video_depth_transfer_white_00010-audio.mp4",
+                                        "person": "portrait.png"}}
+        prompt = _compile_full_reference_prompt(shot, "Natural daylight outside a house.", "N/A", "N/A")
+        self.assertIn("grayscale values encode distance", prompt)
+        self.assertIn("never its black/white surfaces", prompt)
+        self.assertIn("motion, camera movement, framing and timing are retained", prompt)
+
+    def test_anthropomorphic_reference_keeps_identity_but_allows_clothing_override(self):
+        shot = {"mode": "rv2v", "source_video": "source", "replace_person": True,
+                "ref_images": ["character"], "prompt": "Follow <Picture 1>.",
+                "_h3_reference_descriptions": {"character": "拟人土拨鼠多视图，直立、穿灰棕色上衣和裤子"}}
+        prompt = _compile_full_reference_prompt(shot, shot["prompt"], "N/A", "N/A")
+        self.assertIn("for the anthropomorphic character", prompt)
+        self.assertIn("explicit clothing changes in that description take priority", prompt)
+        self.assertNotIn("complete outfit, including footwear", prompt)
+        self.assertNotIn("The subject is a real quadruped", prompt)
+
     def _prompt(self, marker):
         return _compile_full_reference_prompt({
             "mode": "rv2v",

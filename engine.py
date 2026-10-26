@@ -217,16 +217,25 @@ def build_h3_graph(shot: dict, settings: dict, media: dict[str, str], prefix: st
     height = int(settings.get("height", 768))
     if width < 32 or height < 32 or width % 32 or height % 32:
         raise ValueError("画布宽高需为 32 的倍数")
+    if width > 16384 or height > 16384:
+        raise ValueError("画布宽高不能超过 16384 像素")
     context_frames = int(shot.get("continuity_frames") or 0) if shot.get("continuity_video") else 0
     # A continued shot asks H3 for the guide prelude plus the authored duration.
     # The runner snaps that duration onto H3's 17k+5 grid so the request needs no
     # extra padding frames; padding used to be generated and then trimmed away
     # after inference, which also cut the tail of any narration that ran long.
     shot_duration = float(shot.get("_h3_effective_duration") or shot.get("duration", 5))
+    if not 0 < shot_duration <= 15:
+        raise ValueError("镜头时长需大于 0 且不超过 15 秒")
     length = h3_frames(shot_duration + context_frames / 24)
     if length > 3600:
         raise ValueError("单镜头时长超过 H3 节点上限")
-    seed = int(shot.get("seed", 42))
+    try:
+        seed = int(shot.get("seed", 42))
+    except (TypeError, ValueError) as error:
+        raise ValueError("随机种子必须是整数") from error
+    if seed < 0 or seed > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("随机种子需在 0 到 2^64-1 之间")
     family = "creative" if mode in CREATIVE else "reference"
     speed = str(settings.get("generation_speed", "turbo"))
     model_names = MODELS[family]
@@ -417,6 +426,14 @@ def build_h3_graph(shot: dict, settings: dict, media: dict[str, str], prefix: st
             frame_idx = round(time_seconds * 24) + context_frames
             if frame_idx <= context_frames:
                 raise ValueError("官方节点锚点至少从第 1 帧开始")
+            if frame_idx >= length:
+                # The rendered clip is shorter than the authored duration once
+                # the runner snaps it onto H3's frame grid.  An anchor past the
+                # last frame aborts the whole ComfyUI job with a node error.
+                raise ValueError(
+                    f"官方节点锚点 {time_seconds:g} 秒超出了本镜头的实际帧数"
+                    f"（共 {length} 帧，实际时长 {shot_duration:g} 秒）；"
+                    "请把锚点时间提前或调整镜头时长")
             normalized_guides.append((frame_idx, image_id))
         positions = [frame_idx for frame_idx, _ in normalized_guides]
         if len(positions) != len(set(positions)):
@@ -453,7 +470,15 @@ def build_h3_graph(shot: dict, settings: dict, media: dict[str, str], prefix: st
     elif refine_mode == "selflift" and family == "reference" and list(shot.get("ref_images") or []):
         # 参考图镜头的 Picture token 会加长序列，而两阶段采样器只重排视频 token，
         # 低清前缀与高清序列对不上（shape mismatch）。这类镜头改用原画布轻量精修。
+        # 降级后走的还是标准采样器，这里必须先把第一段的 sampled 建出来，
+        # 否则后面的 "same" 精修分支会因为 sampled 未赋值直接报 UnboundLocalError。
         refine_mode = "same"
+        sampler = g.add("KSamplerSelect", sampler_name="res_multistep")
+        schedule = g.add("BasicScheduler", model=model, scheduler="simple", steps=steps, denoise=1)
+        guider = g.add("BasicGuider", model=model, conditioning=conditioning)
+        noise = g.add("RandomNoise", noise_seed=seed)
+        sampled = g.add("SamplerCustomAdvanced", noise=noise, guider=guider, sampler=sampler,
+                        sigmas=schedule, latent_image=latent)
     elif refine_mode == "selflift":
         # Community two-stage sampling (comfyui-SelfLift): the first NFEs run
         # on a low-resolution prefix, the endpoint is lifted to the target
@@ -466,13 +491,27 @@ def build_h3_graph(shot: dict, settings: dict, media: dict[str, str], prefix: st
         sampler = g.add("KSamplerSelect", sampler_name="euler")
         schedule = g.add("BasicScheduler", model=model, scheduler="simple", steps=steps, denoise=1)
         transition_step = max(1, min(int(settings.get("refine_transition_step", 6)), steps - 2))
+        # The sampler node only accepts these in [0, 1]; a value outside that
+        # range is rejected by ComfyUI with an opaque node error.
+        lowres_scale = float(settings.get("refine_lowres_scale", 0.6))
+        refine_rho = float(settings.get("refine_rho", 0.0))
+        refine_w_min = float(settings.get("refine_w_min", 0.5))
+        refine_w_max = float(settings.get("refine_w_max", 1.0))
+        if not 0.25 <= lowres_scale <= 1.0:
+            raise ValueError("精修低清比例需在 0.25 到 1.0 之间")
+        if not 0.0 <= refine_rho <= 1.0:
+            raise ValueError("精修 rho 需在 0 到 1 之间")
+        if not 0.0 <= refine_w_min <= 1.0 or not 0.0 <= refine_w_max <= 1.0:
+            raise ValueError("精修对比度权重需在 0 到 1 之间")
+        if refine_w_min > refine_w_max:
+            raise ValueError("精修对比度下限不能高于上限")
         sampled = g.add("SelfLiftH3Sampler", model=model, positive=conditioning,
                         negative=negative, vae=vae, latent_image=latent, sampler=sampler,
                         sigmas=schedule, seed=seed, cfg=1.0, transition_step=transition_step,
-                        lowres_scale=float(settings.get("refine_lowres_scale", 0.6)),
-                        rho=float(settings.get("refine_rho", 0.0)),
-                        w_min=float(settings.get("refine_w_min", 0.5)),
-                        w_max=float(settings.get("refine_w_max", 1.0)),
+                        lowres_scale=lowres_scale,
+                        rho=refine_rho,
+                        w_min=refine_w_min,
+                        w_max=refine_w_max,
                         upscaler_model=str(settings.get("refine_upscaler") or GOLDFISH_UPSCALER),
                         highres_tiling=bool(settings.get("refine_tiling", True)),
                         upscaler_unload=True)
@@ -882,6 +921,9 @@ def lint_shot_prompt(shot: dict, settings: dict | None = None) -> list[dict]:
                 if int(match.group(1)) > count:
                     add("warning", "unbound_reference", f"提示词中的 {match.group(0)} 未绑定到当前镜头素材。")
                     break
+    for number in shot.get("_h3_unbound_picture_tags") or []:
+        add("warning", "unbound_reference",
+            f"提示词中的图片编号 {number} 没有对应素材，已从提示词中移除，避免它指向别的参考图。")
     if (shot.get("mode") in ("r2v", "v2v", "rv2v")
             and _person_replacement_requested(shot)):
         animal = next((_animal_identity_kind(shot, int(number))
@@ -963,7 +1005,7 @@ def _is_identity_reference(shot: dict, asset_id: str, name: str, visual_descript
             return True
         number = images.index(asset_id) + 1
         prompt = str(shot.get("prompt") or "")
-        for match in re.finditer(rf"<Picture\s+{number}\b|@图片\s*{number}\b", prompt, re.IGNORECASE):
+        for match in re.finditer(rf"<Picture\s*{number}\b|@图片\s*{number}\b", prompt, re.IGNORECASE):
             window = prompt[max(0, match.start() - 40):match.end() + 40].lower()
             if any(word in window for word in
                    ("替换", "换人", "身份", "外貌", "着装", "人像", "肖像",
@@ -993,6 +1035,10 @@ def _requests_person_replacement(shot: dict) -> bool:
     or 「外貌与着装以 <Picture 1> 为准」.
     """
     text = str(shot.get("prompt") or "")
+    if (shot.get("mode") == "rv2v" and shot.get("ref_images")
+            and re.search(r"(?:外观|外貌|身份|形象|服装|毛色|花纹)[^。；;\n]{0,45}"
+                          r"(?:以|按|来自)[^。；;\n]{0,12}(?:身份|角色)?参考图[^。；;\n]{0,8}为准", text)):
+        return True
     if re.search(r"人物.{0,10}替换|替换.{0,10}人物|换人|替换.{0,10}角色|角色.{0,10}替换", text):
         return True
     if re.search(r"(?:replace\w*[^.]{0,24}\b(?:person|face|identity|character)\b"
@@ -1070,15 +1116,25 @@ def _compile_full_reference_prompt(shot: dict, description: str, soundscape: str
     identity_images = {asset_id for asset_id in images
                        if _is_identity_reference(shot, asset_id, asset_name(asset_id),
                                                  str(descriptions.get(asset_id) or ""))}
+    anthropomorphic_images = {asset_id for asset_id in identity_images
+                              if re.search(r"拟人|anthropomorphic", str(descriptions.get(asset_id) or ""), re.I)}
     animal_identities = {asset_id: _animal_identity_kind(shot, index)
-                         for index, asset_id in enumerate(images, 1) if asset_id in identity_images}
+                         for index, asset_id in enumerate(images, 1)
+                         if asset_id in identity_images and asset_id not in anthropomorphic_images}
     for i, asset_id in enumerate(images, 1):
         name = asset_name(asset_id)
         visual_description = str(descriptions.get(asset_id) or "").strip()
         detail = f' Verified user description: {visual_description}.' if visual_description else ''
         if asset_id in identity_images:
             animal = animal_identities.get(asset_id)
-            if animal:
+            if asset_id in anthropomorphic_images:
+                definitions.append(f'<Picture {i}> is the identity reference ({name}) for the anthropomorphic '
+                                   f'character in this shot.{detail} Preserve the reference species, facial '
+                                   'features, fur markings and upright body proportions. Use clothing from the '
+                                   'reference only where the detailed shot description requests it; explicit '
+                                   'clothing changes in that description take priority over the picture. '
+                                   'Do not substitute a generic human or change the character to a quadruped.')
+            elif animal:
                 # Auto-generated multiview descriptions can still say "person"
                 # after a sheet is replaced by a cat or dog. Never let that
                 # stale label compete with the explicit tagged shot identity.
@@ -1101,7 +1157,7 @@ def _compile_full_reference_prompt(shot: dict, description: str, soundscape: str
             if any(word in (name + " " + visual_description).lower() for word in
                    ("四视图", "五视图", "六视图", "三视图", "多视图", "多视角", "multiview", "turnaround", "face sheet")):
                 anatomy = (f'the {animal}’s face, coat markings and quadruped anatomy' if animal
-                           else 'the person’s face, body proportions and outfit')
+                           else 'the character’s face, body proportions and requested clothing details')
                 definitions.append(f'<Picture {i}> is a multi-view identity sheet. Use it to lock {anatomy}; '
                                    'never render the sheet’s grid or panels as the video frame. Its environment, '
                                    'palette and lighting may still carry into the shot when the detailed shot '
@@ -1143,6 +1199,12 @@ def _compile_full_reference_prompt(shot: dict, description: str, soundscape: str
         is_source = bool(source_video and i == 1 and asset_id == source_video)
         role = "the source video being edited" if is_source else "a video reference for motion and temporal structure"
         definitions.append(f'<Video {i}> is {role} ({name}).')
+        source_is_depth = is_source and bool(re.search(r"(?:^|[_\W])depth(?:[_\W]|$)|深度", name, re.I))
+        if source_is_depth:
+            definitions.append(f'<Video {i}> is a depth map: its grayscale values encode distance, '
+                               'not visible color, sky, time of day, materials or lighting. Use its '
+                               'motion, subject placement, framing and camera movement; render the '
+                               'appearance from the identity pictures and the authored scene description.')
         # 官方 ref-en.txt §4.1：partially_preserved = 仍在使用、但部分特征被改变。
         # “保留动作/运镜、换掉人物”正是这个标记；weak_reference 只剩风格/构图大致相似，会丢动作。
         default = "partially_preserved" if is_source else "weak_reference"
@@ -1168,10 +1230,18 @@ def _compile_full_reference_prompt(shot: dict, description: str, soundscape: str
                         "person is replaced by the identity reference — the source's own face and body are not kept")
         else:
             note = "the reference video role is followed in the target shot"
+        if source_is_depth:
+            note += ("; preserve depth geometry and motion only, never its black/white surfaces, "
+                     "dark sky or exposure as the target appearance")
         retention.append(f'<Video {i}> ({"source edit" if is_source else "motion and temporal structure"}): {marker} - {note}.')
     characters = shot.get("_h3_characters") or []
     picture_index = {asset_id: i for i, asset_id in enumerate(images, 1)}
-    audio_index = {asset_id: i for i, asset_id in enumerate(audios, 1)}
+    # ComfyUI gives the edited source video's own soundtrack its own <Audio 1>
+    # label — the soundtrack item is emitted before the standalone audio
+    # references — so every standalone audio number shifts by one.  Without
+    # this the prompt calls the source recording a voice-timbre reference.
+    soundtrack_offset = 1 if (source_video and shot.get("audio_mode") == "source") else 0
+    audio_index = {asset_id: i + soundtrack_offset for i, asset_id in enumerate(audios, 1)}
     for fallback_index, character in enumerate(characters, 1):
         i = max(1, int(character.get("subject_number") or fallback_index))
         sources = []
@@ -1183,7 +1253,7 @@ def _compile_full_reference_prompt(shot: dict, description: str, soundscape: str
         if multiview in picture_index:
             view_label = {"four": "four-view", "five": "five-view", "six": "six-view"}.get(
                 character.get("multiview_layout"), "four-view")
-            sources.append(f"face, body proportions and outfit stay consistent with the {view_label} sheet <Picture {picture_index[multiview]}>")
+            sources.append(f"face and body proportions stay consistent with the {view_label} sheet <Picture {picture_index[multiview]}>; clothing follows the detailed shot request")
             definitions.append(f"<Picture {picture_index[multiview]}> is a {view_label} identity sheet, not a panel layout for the video frame.")
         if voice in audio_index:
             sources.append(f"voice timbre comes from <Audio {audio_index[voice]}>")
@@ -1197,7 +1267,8 @@ def _compile_full_reference_prompt(shot: dict, description: str, soundscape: str
             definitions.append(f'<Audio {audio_index[voice]}> is the voice-timbre reference for <Subject {i}> ({speaker_id}).')
     audio_markers = {"fully_copy", "partially_copy", "reference", "weak_reference"}
     profile_voice_assets = {character.get("voice_asset") for character in characters if character.get("voice_asset")}
-    for i, asset_id in enumerate(audios, 1):
+    for index, asset_id in enumerate(audios, 1):
+        i = index + soundtrack_offset
         role = (shot.get("ref_audio_roles") or {}).get(asset_id, "reference")
         if role not in audio_markers:
             role = "reference"

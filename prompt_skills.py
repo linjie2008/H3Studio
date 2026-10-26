@@ -52,13 +52,13 @@ def _base_mode_guide(text: str, mode: str) -> str:
 
 
 def _frontmatter(markdown: str, key: str) -> str:
-    match = re.search(rf"(?m)^{re.escape(key)}:\s*(.+?)\s*$", markdown.split("---", 2)[1] if markdown.startswith("---") and "---" in markdown[3:] else "")
+    match = re.search(rf"(?m)^[ \t]*{re.escape(key)}:\s*(.+?)\s*$", markdown.split("---", 2)[1] if markdown.startswith("---") and "---" in markdown[3:] else "")
     return match.group(1).strip().strip("\"'") if match else ""
 
 
 def _describe(skill_id: str, folder: Path, builtin: bool) -> dict:
     text = (folder / "SKILL.md").read_text(encoding="utf-8", errors="replace")
-    name = _frontmatter(text, "name") or folder.name
+    name = _frontmatter(text, "display_name") or _frontmatter(text, "name") or folder.name
     description = _frontmatter(text, "description") or "导入的提示词 Skill"
     if skill_id.startswith("aicg3d:"):
         if folder.name == "minimax-h3-short-drama-director":

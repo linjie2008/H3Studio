@@ -44,7 +44,10 @@ def post_api_enhance_sequence(req, path, parts, url):
         if prepared.get("mode") in {"t2v", "i2v", "fl2v"}:
             identity_assets.intersection_update(filter(None, (
                 prepared.get("first_image"), prepared.get("last_image"))))
-        context = {"segment": {"position": index + 1, "total": len(saved_shots),
+        context = {"project_shared_prompt": str(project_data.get("shared_prompt") or ""),
+            "replacement_settings": {key: saved_shot.get(key) for key in
+                                     ("replace_person", "swap_lora", "ref_background")},
+            "segment": {"position": index + 1, "total": len(saved_shots),
             "is_first": index == 0, "is_last": index == len(saved_shots) - 1},
             "references": [], "characters": prepared.get("_h3_characters", []),
             "entities": prepared.get("_h3_entities", []),
@@ -128,7 +131,10 @@ def post_api_enhance(req, path, parts, url):
             # optimization: its subjects and Picture tags can leak.
             return {"name": str(item.get("name") or "镜头")[:120],
                     "mode": str(item.get("mode") or "t2v")}
-        reference_context = {"segment": {
+        reference_context = {"project_shared_prompt": str(project_data.get("shared_prompt") or ""),
+            "replacement_settings": {key: saved_shot.get(key) for key in
+                                     ("replace_person", "swap_lora", "ref_background")},
+            "segment": {
             "position": shot_index + 1, "total": len(saved_shots),
             "is_first": shot_index == 0, "is_last": shot_index == len(saved_shots) - 1,
             "previous_shot": neighbor_context(shot_index - 1),

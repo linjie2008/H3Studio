@@ -121,6 +121,7 @@ def _preserve_spoken_seam(previous: dict, current: dict, overlap_frames: int) ->
 _MODEL_SWITCH_LOCK = threading.Lock()
 _DIRECTOR_RUN_LOCK = threading.Lock()
 _ACTIVE_MODEL_FAMILY: str | None = None
+_ACTIVE_MODEL_RUN_ID: str | None = None
 
 
 def _graph_model_family(graph: dict) -> str:
@@ -230,7 +231,9 @@ def prepare_shot(original: dict, project: dict) -> dict:
     requested_assets = {number_to_asset[number] for number in requested_numbers if number in number_to_asset}
     # Gallery selection is only a visual planning marker. Only an authored
     # picture tag binds a shot-level image to H3; old ref_images/manual lists
-    # must not silently introduce unmentioned people or objects.
+    # must not silently introduce unmentioned people or objects.  Video editing
+    # needs the same rule: a leftover gallery image would occupy a slot the
+    # prompt then reads as a different reference.
     if shot.get("mode") in {"r2v", "rv2v"}:
         shot["ref_images"] = [asset_id for asset_id in shot.get("ref_images") or []
                               if asset_id in requested_assets]
@@ -383,6 +386,10 @@ def prepare_shot(original: dict, project: dict) -> dict:
     # A typed global alias such as <Picture 4> or @图片4 must bind its asset to
     # this shot. Otherwise the prompt contains a label H3 cannot resolve because
     # no corresponding image was actually sent in ref_images.
+    # A typed global alias such as <Picture 4>, @图片4 or a plain 图片4 must bind
+    # its asset to this shot. Otherwise the prompt contains a label H3 cannot
+    # resolve because no corresponding image was actually sent in ref_images,
+    # and the number silently points at whichever image owns that slot.
     if shot.get("mode") in reference_modes:
         for number in sorted(requested_numbers):
             asset_id = number_to_asset.get(number)
@@ -452,7 +459,7 @@ def prepare_shot(original: dict, project: dict) -> dict:
 # 工作流版本：只要 build_h3_graph 的行为变了（新增/移除节点、改变 LoRA 挂载、改变
 # 步数策略等），就把它加一位，让旧成片缓存自动失效——否则同一份镜头设置会命中旧缓存，
 # 把“改完引擎却没重新生成”的旧片段拼回成片。
-WORKFLOW_REVISION = "h3studio_graph_rev_2026_10_22_selflift_refine_audio_keep_face_refine"
+WORKFLOW_REVISION = "h3studio_graph_rev_2026_10_24_depth_identity_roles"
 
 
 def shot_refine_mode(shot: dict, project: dict) -> str:
@@ -486,7 +493,7 @@ def _shot_signature(shot: dict, project: dict, assets: dict, previous_signature:
     if shot.get("continuity"):
         # Invalidate cached generations after changing the scene-adaptive
         # handoff rules, without invalidating unrelated projects.
-        relevant_project["continuity_algorithm"] = "h3_native_scene_adaptive_continuity_v21_grid_prelude_audio"
+        relevant_project["continuity_algorithm"] = "h3_native_scene_adaptive_continuity_v22_native_canvas"
     elif shot.get("continuous_take"):
         relevant_project["continuity_algorithm"] = "h3studio_single_subject_prompt_v7"
     ids = {value for key in ("first_image", "last_image", "source_video") if (value := shot.get(key))}
@@ -556,6 +563,12 @@ def _continuity_subject_relation(previous_refs, current_refs) -> str:
     return "same"
 
 
+def _identity_handoff_changed(previous_refs, current_refs, strict=False) -> bool:
+    previous, current = set(previous_refs or []), set(current_refs or [])
+    return bool(previous and current and
+                (previous.isdisjoint(current) or (strict and previous != current)))
+
+
 def _shot_identity_refs(shot: dict, project: dict, assets: dict) -> list[str]:
     """Separate person references from shared scenery before a continuity handoff."""
     characters = {item.get("id"): item for item in project.get("characters", [])}
@@ -564,6 +577,17 @@ def _shot_identity_refs(shot: dict, project: dict, assets: dict) -> list[str]:
         profile = characters.get(character_id) or {}
         profile_refs.extend(filter(None, (profile.get("portrait_asset"), profile.get("multiview_asset"))))
     descriptions = project.get("image_descriptions") or {}
+    non_person_words = ("飞机", "双翼机", "战机", "机身", "座舱", "机场", "跑道", "场景", "背景", "地点",
+                        "aircraft", "airplane", "biplane", "cockpit", "runway", "airfield",
+                        "scene", "background", "landscape")
+    def is_non_person(asset_id: str) -> bool:
+        metadata = (str(descriptions.get(asset_id) or "") + " " +
+                    str(assets.get(asset_id, {}).get("name") or "")).lower()
+        if any(word in metadata for word in
+               ("四视图", "三视图", "五视图", "六视图", "人物设定", "角色设定",
+                "portrait", "face sheet", "character sheet")):
+            return False
+        return any(word in metadata for word in non_person_words)
     image_numbers = project.get("reference_image_numbers") or {
         asset_id: index for index, (asset_id, asset) in enumerate(
             ((key, value) for key, value in assets.items()
@@ -588,7 +612,7 @@ def _shot_identity_refs(shot: dict, project: dict, assets: dict) -> list[str]:
         if not any(term in nearby for term in person_terms):
             continue
         asset_id = number_to_asset.get(int(match.group(1) or match.group(2)))
-        if asset_id:
+        if asset_id and not is_non_person(asset_id):
             explicit_person_refs.add(asset_id)
             if asset_id not in refs:
                 refs.append(asset_id)
@@ -600,6 +624,8 @@ def _shot_identity_refs(shot: dict, project: dict, assets: dict) -> list[str]:
                    "location", "runway", "landscape", "environment")
     identities = []
     for asset_id in refs:
+        if is_non_person(asset_id):
+            continue
         if asset_id in explicit_person_refs:
             identities.append(asset_id)
             continue
@@ -777,12 +803,17 @@ def _make_media_map(shot: dict, project: dict, assets: dict) -> dict[str, str]:
 
 
 def _submit(graph: dict, run_id: str | None = None) -> str:
-    """Submit a graph, releasing old model caches at model-family boundaries."""
-    global _ACTIVE_MODEL_FAMILY
+    """Release cached models only when the next graph changes model family."""
+    global _ACTIVE_MODEL_FAMILY, _ACTIVE_MODEL_RUN_ID
     family = _graph_model_family(graph)
     with _MODEL_SWITCH_LOCK:
         previous = _ACTIVE_MODEL_FAMILY
-        if previous != family:
+        new_run = run_id is not None and run_id != _ACTIVE_MODEL_RUN_ID
+        if new_run:
+            update_run(run_id, current="任务准备 · 释放翻译和提示词模型")
+            helpers = _release_idle_local_models()
+            update_run(run_id, memory_preparation={"time": time.time(), **helpers})
+        if previous is not None and previous != family:
             from_label = _model_family_label(previous)
             to_label = _model_family_label(family)
             if run_id:
@@ -813,6 +844,15 @@ def _submit(graph: dict, run_id: str | None = None) -> str:
                            memory_switch={"from": previous or "unknown", "to": family,
                                           "status": "released", "time": time.time(),
                                           "detail": "已卸载旧模型并释放显存缓存"})
+        elif new_run and run_id:
+            label = _model_family_label(family)
+            known_cache = previous == family
+            update_run(run_id, current=f"保留现有模型缓存，正在提交{label}任务",
+                       memory_switch={"from": previous or "unknown", "to": family,
+                                      "status": "reused" if known_cache else "preserved",
+                                      "time": time.time(),
+                                      "detail": ("同系列模型已加载，保留缓存" if known_cache else
+                                                 "导演台刚启动，保留 ComfyUI 缓存并由其调度模型")})
         # ComfyUI can be slow to accept a prompt while the worker is decoding the
         # previous clip or loading a model. A single 30 s timeout used to abort
         # the whole run; retry instead and surface progress to the workbench.
@@ -836,6 +876,7 @@ def _submit(graph: dict, run_id: str | None = None) -> str:
         if response.get("node_errors"):
             raise RuntimeError(json.dumps(response["node_errors"], ensure_ascii=False))
         _ACTIVE_MODEL_FAMILY = family
+        _ACTIVE_MODEL_RUN_ID = run_id
         return response["prompt_id"]
 
 
@@ -863,6 +904,40 @@ def _resume_prompt(run_id: str, stage: str, shot_id: str) -> str | None:
         return None
     prompt_id = str(run.get("prompt_id") or "")
     return prompt_id if _prompt_state(prompt_id) in ("active", "completed") else None
+
+
+def _release_idle_local_models() -> dict:
+    """Wait for translation to exit and for the local prompt server to sleep."""
+    from prompt_tools import _LOCAL_TRANSLATION_LOCK
+    with _LOCAL_TRANSLATION_LOCK:
+        report = {"translation": "released", "prompt_model": "unavailable"}
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def local_json(path):
+        with opener.open("http://127.0.0.1:11434" + path, timeout=2) as response:
+            return json.load(response)
+
+    try:
+        props = local_json("/props")
+        if props.get("is_sleeping") is True:
+            report["prompt_model"] = "sleeping"
+            return report
+        if props.get("is_sleeping") is not False:
+            report["prompt_model"] = "unmanaged"
+            return report
+        if any(slot.get("is_processing") for slot in local_json("/slots")):
+            report["prompt_model"] = "busy"
+            return report
+        # llama-server unloads after one idle second. /props never wakes it.
+        for _ in range(12):
+            time.sleep(0.25)
+            if local_json("/props").get("is_sleeping"):
+                report["prompt_model"] = "sleeping"
+                return report
+        report["prompt_model"] = "pending_sleep"
+    except (OSError, ValueError):
+        pass
+    return report
 
 
 def _release_comfy_memory() -> None:
@@ -1051,6 +1126,14 @@ def run_post_upscale(run_id: str) -> None:
         status = "cancelled" if "用户取消任务" in str(error) else "error"
         update_run(run_id, status=status, error=str(error), finished_at=time.time(),
                    current="已有成片超分失败", active_stage="", active_shot_id="")
+
+
+def _continuity_source(item: dict) -> Path:
+    """Use the uncropped canvas so delivery fitting cannot zoom the next shot."""
+    for key in ("continuity_file", "h3_file", "file"):
+        if item.get(key) and (source := OUTPUTS / item[key]).is_file():
+            return source
+    raise FileNotFoundError("接续镜头的视频文件不存在")
 
 
 def _tail_clip(video: Path, target: Path, frames: int) -> None:
@@ -1583,7 +1666,7 @@ def _match_handoff_exposure(previous: Path, current: Path, target: Path) -> tupl
         next_drift = abs(sum(after[1]) - sum(after[0])) / len(after[0])
         mean = sum(before[-1]) / len(before[-1])
         contrast = math.sqrt(sum((value - mean) ** 2 for value in before[-1]) / len(before[-1]))
-        if not (max(1.5, previous_drift * 1.5, next_drift * 1.5) <= abs(delta)
+        if not (max(0.75, previous_drift * 1.5, next_drift * 1.5) <= abs(delta)
                 <= contrast * 0.20):
             return None, None, None
         # The geq luma scale measured on generated YUV clips is about 1.15
@@ -1598,7 +1681,12 @@ def _match_handoff_exposure(previous: Path, current: Path, target: Path) -> tupl
                        check=True, timeout=300)
         matched = _handoff_gray_frames(target)
         adjusted = _gray_distance(before[-1], matched[0])
-        if len(matched) != len(after) or adjusted >= seam * 0.85:
+        brightness_error = abs(sum(before[-1]) - sum(matched[0])) / len(matched[0])
+        # A one-level flash has little effect on structural distance, but is
+        # visible across an otherwise stable view. Verify its luma separately.
+        improvement = 0.95 if abs(delta) < 1.5 else 0.85
+        if (len(matched) != len(after) or adjusted >= seam * improvement
+                or brightness_error > abs(delta) * 0.5):
             target.unlink(missing_ok=True)
             return None, None, None
         return round(seam, 3), round(adjusted, 3), round(gain, 3)
@@ -1948,7 +2036,7 @@ def remerge_run(run_id: str, project: dict) -> dict:
     merged = output_dir / f"merged_remerge_{stamp}.mp4"
     _merge(paths, merged, int(project.get("width", 1024)), int(project.get("height", 576)))
     update_run(run_id, merged=str(merged.relative_to(OUTPUTS)),
-               merge_seam_algorithm="adaptive_structural_v6_continuous_audio", merge_seam_adjustments=seams,
+               merge_seam_algorithm="adaptive_structural_v7_continuous_audio", merge_seam_adjustments=seams,
                remerged_at=time.time(), remerge_settings={key: project.get(key) for key in
                                                           ("seam_mode", "seam_prefix_frames",
                                                            "seam_motion_frames", "seam_exposure")})
@@ -2099,7 +2187,7 @@ def run_project(run_id: str) -> None:
                                         if item["id"] == preceding_item.get("shot_id")), None)
                                   if preceding_item else shots[index - 1] if index > 0 else None)
             if source_run and preceding_item and preceding_original:
-                previous = OUTPUTS / preceding_item["file"]
+                previous = _continuity_source(preceding_item)
                 previous_signature = preceding_item.get("signature")
             continuity = _continuity_policy(project, original,
                                             source_index if source_run else index)
@@ -2115,16 +2203,19 @@ def run_project(run_id: str) -> None:
                 current_identities = _shot_identity_refs(original, project, assets)
                 shot["continuity_subject_relation"] = _continuity_subject_relation(
                     previous_identities, current_identities)
-                if shot["continuity_subject_relation"] == "new":
+                identity_changed = _identity_handoff_changed(
+                    previous_identities, current_identities,
+                    strict=bool(project.get("identity_first_on_switch")))
+                if identity_changed:
                     _strengthen_incoming_identity_reference(shot, current_identities)
                     if project.get("identity_first_on_switch"):
-                        # A hard guide of the outgoing person's final frames can
-                        # override the incoming face and uniform. For projects
-                        # that prioritize distinct people, keep the shared scene
-                        # and prompt but do not feed the old person as a guide.
                         continuity = {"enabled": False, "frames": 0, "strength": "none"}
-                    elif continuity.get("enabled") and continuity.get("strength") == "strong":
-                        continuity["frames"] = NEW_IDENTITY_CONTEXT_FRAMES
+                    elif continuity.get("enabled"):
+                        # Keep the final, usually empty scene frames for camera
+                        # continuity without carrying the old person's closeup
+                        # through the long H3 guide window.
+                        continuity["frames"] = min(
+                            continuity["frames"], NEW_IDENTITY_CONTEXT_FRAMES)
             shot["continuous_take"] = bool(project.get("continuous_take", True)) and not fresh_composition
             shot["continuity"] = continuity["enabled"]
             shot["continuity_frames"] = continuity["frames"]
@@ -2173,7 +2264,7 @@ def run_project(run_id: str) -> None:
                 cached_seconds = round(round(video_duration(OUTPUTS / cached["file"]) * 24) / 24, 3)
                 results.append({**cached, "effective_duration": cached_seconds,
                                 "planned_duration": cached.get("planned_duration") or cached_seconds})
-                previous = OUTPUTS / cached["file"]
+                previous = _continuity_source(cached)
                 previous_signature = signature
                 reused_shot_ids.append(shot["id"])
                 update_run(run_id, results=results, progress=f"{index + 1}/{len(shots)}",
@@ -2317,6 +2408,7 @@ def run_project(run_id: str) -> None:
                         raise RuntimeError("用户取消任务")
             # 先裁到交付尺寸，再在人脸恢复：这样脸部检测和细节恢复都作用在
             # 最终分辨率上（1080p 下脸约 194px，4K 下约 388px）。
+            continuity_source = final
             final = _fit_output_size(final, output_dir, index, project)
             if project.get("face_refine"):
                 refined = output_dir / f"shot_{index:03d}_face.mp4"
@@ -2328,12 +2420,13 @@ def run_project(run_id: str) -> None:
                 refined.replace(final)
             source = COMFY_INPUT / media[shot["source_video"]] if shot.get("source_video") else None
             _audio_mode(final, source, shot.get("audio_mode", "generate"))
-            previous = final
+            previous = continuity_source
             previous_signature = signature
             plan = shot.get("_h3_trim_plan") or {}
             actual_seconds = round(video_duration(final) * 24) / 24
             results.append({"shot_id": shot["id"], "signature": signature, "file": str(final.relative_to(OUTPUTS)),
                             "h3_file": str(first_pass.relative_to(OUTPUTS)),
+                            "continuity_file": str(continuity_source.relative_to(OUTPUTS)),
                             "pre_refine_file": str(pre_refine.relative_to(OUTPUTS)) if pre_refine else None,
                             "transition_mode": shot.get("transition_mode", "continue"),
                             "handoff_visible_frames": shot.get("continuity_visible_frames", 0),
@@ -2427,7 +2520,7 @@ def run_project(run_id: str) -> None:
                 _merge(merge_items, merged,
                        int(project.get("width", 1024)), int(project.get("height", 576)))
                 update_run(run_id, merged=str(merged.relative_to(OUTPUTS)),
-                           merge_seam_algorithm="adaptive_structural_v6_continuous_audio", merge_seam_adjustments=seam_adjustments,
+                           merge_seam_algorithm="adaptive_structural_v7_continuous_audio", merge_seam_adjustments=seam_adjustments,
                            omitted_shots=omitted)
         update_run(run_id, status="completed", current="", finished_at=time.time(),
                    active_stage="", active_shot_id="", active_prefix="",

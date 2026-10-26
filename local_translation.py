@@ -137,14 +137,10 @@ def main() -> int:
             print(translator.translate(sys.stdin.read()))
             return 0
         if args.worker:
-            for line in sys.stdin:
-                try:
-                    request = json.loads(line)
-                    answer = {"translation": translator.translate(
-                        request["text"], request.get("target_language", "zh"))}
-                except Exception as error:
-                    answer = {"error": str(error)}
-                print(json.dumps(answer, ensure_ascii=False), flush=True)
+            request = json.loads(sys.stdin.readline())
+            answer = {"translation": translator.translate(
+                request["text"], request.get("target_language", "zh"))}
+            print(json.dumps(answer, ensure_ascii=False), flush=True)
             return 0
         parser.error("choose --worker or --translate")
     except Exception as error:

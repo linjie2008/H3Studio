@@ -1,0 +1,328 @@
+"""Face-region detail recovery for rendered H3 shots.
+
+The diffusion model flattens skin, eyelashes and hair into a waxy surface.
+Global sharpening cannot fix that without ringing the whole frame, so this
+pass works only inside the detected face box:
+
+* a real ESRGAN (4x-UltraSharp / RealESRGAN) reconstructs the face region --
+  learned detail, not a sharpening approximation;
+* a light CLAHE + unsharp pass adds micro-contrast when no ESRGAN model is
+  available;
+* a whisper of grain breaks the plastic sheen that reads as "AI look".
+
+It never changes shape or colour of features, so identity stays intact.
+Faces are found with InsightFace (buffalo_l) when available and fall back to
+OpenCV's Haar cascade, so the pass degrades to a copy instead of failing a
+render.
+
+Usage:  face_refine.py input.mp4 output.mp4
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+
+try:
+    import cv2
+except ImportError:  # pragma: no cover - ComfyUI venv always ships OpenCV
+    raise SystemExit("face_refine 需要 OpenCV（cv2）")
+
+
+FRAME_SIZE = 12  # analysis frame edge for the detector
+DETECT_EVERY = 3  # detect on every Nth frame, reuse the box in between
+ROI_EXPAND = 0.28  # face box padding around the detected landmarks
+CLAHE_CLIP = 1.6
+CLAHE_BLEND = 0.40  # how much of the local contrast shift is kept
+UNSHARP_RADIUS = 1.1
+UNSHARP_AMOUNT = 1.1  # strength of the high-frequency detail added back
+GRAIN_SIGMA = 0.35  # luminance levels of micro grain
+
+# Real ESRGAN for the face region.  Post-processing cannot invent detail the
+# model never had, but a learned upscaler restores the texture the diffusion
+# model flattened -- this is the only way to make a face genuinely crisp.
+ESRGAN_MODELS = {
+    "ultrasharp": "/home/administrator/ComfyUI/models/upscale_models/4x-UltraSharp.pth",
+    "realesrgan": "/home/administrator/ComfyUI/models/upscale_models/RealESRGAN_x4plus.pth",
+}
+ESRGAN_MODEL = os.environ.get("H3_STUDIO_FACE_ESRGAN", "ultrasharp")
+# ESRGAN 只有在交付分辨率 >= 2 倍渲染分辨率时才有净收益：它是 4 倍放大器，
+# 折回 1 倍会把学到的细节平均掉，此时锐化近似反而更划算。
+ESRGAN_ENABLED = os.environ.get("H3_STUDIO_FACE_USE_ESRGAN", "0") == "1"
+_ESRGAN = {"model": None, "device": None}
+
+
+def _load_esrgan():
+    """Load the ESRGAN upscaler once, if ComfyUI's runtime is importable."""
+    if not ESRGAN_ENABLED:
+        return None
+    if _ESRGAN["model"] is not None:
+        return _ESRGAN["model"]
+    path = ESRGAN_MODELS.get(ESRGAN_MODEL, ESRGAN_MODELS["ultrasharp"])
+    if not Path(path).is_file():
+        print(f"[face_refine] 找不到 ESRGAN 权重 {path}，退回锐化近似", flush=True)
+        return None
+    try:
+        sys.path.insert(0, "/home/administrator/ComfyUI")
+        import comfy.utils
+        import torch
+        from spandrel import ModelLoader
+
+        state = comfy.utils.load_torch_file(path, safe_load=True)
+        descriptor = ModelLoader().load_from_state_dict(state)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = descriptor.model.to(device).eval()
+        _ESRGAN.update({"model": (descriptor, model, torch, device), "device": device})
+        print(f"[face_refine] ESRGAN 就绪：{Path(path).name}（{device}，×{descriptor.scale}）", flush=True)
+        return _ESRGAN["model"]
+    except Exception as exc:  # pragma: no cover - depends on local install
+        print(f"[face_refine] ESRGAN 加载失败（{exc}），退回锐化近似", flush=True)
+        return None
+
+
+def _esrgan_face(roi: np.ndarray) -> np.ndarray:
+    """Run the ESRGAN upscaler over one face crop and return it at crop size."""
+    loaded = _load_esrgan()
+    if loaded is None:
+        return roi
+    descriptor, model, torch, device = loaded
+    height, width = roi.shape[:2]
+    try:
+        tensor = torch.from_numpy(roi).float().permute(2, 0, 1).unsqueeze(0).to(device) / 255.0
+        with torch.no_grad():
+            output = model(tensor)
+        output = output.clamp(0, 1).mul(255).round().to(torch.uint8)
+        output = output[0].permute(1, 2, 0).cpu().numpy()
+        # The model is a 4x upscaler: fold it back onto the crop, which keeps
+        # the learned detail but does not change the frame geometry.
+        return cv2.resize(output, (width, height), interpolation=cv2.INTER_AREA)
+    except Exception as exc:  # pragma: no cover - runtime guard
+        print(f"[face_refine] ESRGAN 推理失败：{exc}", flush=True)
+        return roi
+
+
+def _detect_faces_haar(gray: np.ndarray) -> list[tuple[int, int, int, int]]:
+    candidates = []
+    data_dir = getattr(cv2, "data", None)
+    if data_dir is not None:
+        candidates.append(Path(data_dir.haarcascades) / "haarcascade_frontalface_default.xml")
+    cascade = None
+    for path in candidates:
+        if path.is_file():
+            loaded = cv2.CascadeClassifier(str(path))
+            if not loaded.empty():
+                cascade = loaded
+                break
+    if cascade is None:
+        return []
+    boxes = cascade.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=6, minSize=(48, 48))
+    return [(int(x), int(y), int(w), int(h)) for x, y, w, h in boxes]
+
+
+class FaceFinder:
+    """InsightFace detector with an OpenCV fallback and temporal smoothing."""
+
+    def __init__(self) -> None:
+        self.app = None
+        self.backend = "none"
+        try:
+            from insightface.app import FaceAnalysis
+
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            app = FaceAnalysis(name="buffalo_l", providers=providers)
+            app.prepare(ctx_id=-1, det_size=(640, 640))
+            self.app = app
+            self.backend = "insightface"
+        except Exception as exc:  # pragma: no cover - depends on local install
+            print(f"[face_refine] InsightFace 不可用（{exc}），回退 OpenCV Haar", flush=True)
+        self._last_box: tuple[int, int, int, int] | None = None
+
+    def find(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+        h, w = frame.shape[:2]
+        if self.app is not None:
+            try:
+                # InsightFace expects BGR; the pipeline decodes RGB.
+                faces = self.app.get(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                if faces:
+                    boxes = []
+                    for face in faces:
+                        x1, y1, x2, y2 = [int(v) for v in face.bbox]
+                        boxes.append((x1, y1, max(1, x2 - x1), max(1, y2 - y1)))
+                    self._last_box = max(boxes, key=lambda b: b[2] * b[3])
+                    return boxes
+            except Exception as exc:  # pragma: no cover - runtime guard
+                print(f"[face_refine] 检测异常，回退 Haar：{exc}", flush=True)
+        small = cv2.resize(frame, (0, 0), fx=FRAME_SIZE / max(w, 1), fy=FRAME_SIZE / max(h, 1))
+        scale_x, scale_y = w / small.shape[1], h / small.shape[0]
+        gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+        boxes = [(int(x * scale_x), int(y * scale_y), int(bw * scale_x), int(bh * scale_y))
+                 for x, y, bw, bh in _detect_faces_haar(gray)]
+        if boxes:
+            self._last_box = max(boxes, key=lambda b: b[2] * b[3])
+        elif self._last_box is not None:
+            # A face that leaves the frame should not drag the box with it,
+            # but a missed detection should not either: reuse the last box.
+            boxes = [self._last_box]
+        return boxes
+
+
+def _expand(box: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
+    x, y, w, h = box
+    pad_x, pad_y = int(w * ROI_EXPAND), int(h * ROI_EXPAND)
+    x0 = max(0, x - pad_x)
+    y0 = max(0, y - pad_y)
+    x1 = min(width, x + w + pad_x)
+    y1 = min(height, y + h + pad_y)
+    if x1 - x0 < 20 or y1 - y0 < 20:
+        return (0, 0, 0, 0)
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+def _feather_mask(width: int, height: int, ratio: float = 0.30) -> np.ndarray:
+    """Smooth alpha for the ROI so the enhancement has no visible rectangle."""
+    fx = max(2, int(width * ratio))
+    fy = max(2, int(height * ratio))
+    ramp_x = np.clip(np.minimum(np.arange(width), np.arange(width)[::-1]) / fx, 0.0, 1.0)
+    ramp_y = np.clip(np.minimum(np.arange(height), np.arange(height)[::-1]) / fy, 0.0, 1.0)
+    mask = ramp_x[None, :] * ramp_y[:, None]
+    # Smoothstep keeps the transition free of a visible kink.
+    return mask * mask * (3.0 - 2.0 * mask)
+
+
+def _enhance_roi(frame: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
+    x, y, w, h = box
+    # The high-frequency residual has to be computed on a padded neighbourhood:
+    # blurring inside the cropped box alone makes the border pixels see
+    # replicated edges, which shows up as a visible rectangle around the face.
+    pad = 12
+    px0, py0 = max(0, x - pad), max(0, y - pad)
+    px1, py1 = min(frame.shape[1], x + w + pad), min(frame.shape[0], y + h + pad)
+    patch = frame[py0:py1, px0:px1]
+    gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=(8, 8))
+    lifted = clahe.apply(gray.astype(np.uint8)).astype(np.float32)
+    blurred = cv2.GaussianBlur(lifted, (0, 0), UNSHARP_RADIUS)
+    detail_full = (lifted - blurred) * UNSHARP_AMOUNT + (lifted - gray) * CLAHE_BLEND
+    detail = detail_full[y - py0:y - py0 + h, x - px0:x - px0 + w]
+
+    roi = frame[y:y + h, x:x + w]
+    if roi.size == 0:
+        return frame
+    # Learned detail first (ESRGAN), then the micro-contrast pass on top.
+    roi = _esrgan_face(roi)
+    lab = cv2.cvtColor(roi, cv2.COLOR_RGB2LAB)
+    luminance, chroma_a, chroma_b = cv2.split(lab)
+    alpha = _feather_mask(w, h)
+    boosted = np.clip(luminance.astype(np.float32) + detail * alpha, 0, 255).astype(np.uint8)
+    out = cv2.cvtColor(cv2.merge((boosted, chroma_a, chroma_b)), cv2.COLOR_LAB2RGB)
+    frame[y:y + h, x:x + w] = out
+    return frame
+
+
+def _video_meta(path: Path) -> tuple[int, int, float]:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,avg_frame_rate", "-of", "json", str(path)],
+        capture_output=True, text=True, check=True, timeout=60)
+    stream = (json.loads(result.stdout).get("streams") or [{}])[0]
+    width, height = int(stream.get("width", 0)), int(stream.get("height", 0))
+    rate = str(stream.get("avg_frame_rate") or "24/1")
+    try:
+        num, den = rate.split("/")
+        fps = float(num) / float(den or 1)
+    except ValueError:
+        fps = 24.0
+    if not width or not height:
+        raise RuntimeError(f"无法读取视频画布：{path.name}")
+    return width, height, fps
+
+
+def refine(input_path: Path, output_path: Path) -> None:
+    width, height, fps = _video_meta(input_path)
+    finder = FaceFinder()
+    frame_bytes = width * height * 3
+    decode = subprocess.Popen(
+        ["ffmpeg", "-v", "error", "-i", str(input_path), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    temp = output_path.with_suffix(".tmp.mp4")
+    encode = subprocess.Popen(
+        ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+         "-s", f"{width}x{height}", "-r", f"{fps:.6f}", "-i", "-",
+         "-c:v", "libx264", "-preset", "fast", "-crf", "16", "-pix_fmt", "yuv420p", str(temp)],
+        stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    touched = 0
+    index = 0
+    try:
+        assert decode.stdout is not None and encode.stdin is not None
+        while True:
+            raw = decode.stdout.read(frame_bytes)
+            if len(raw) < frame_bytes:
+                break
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3).copy()
+            if index % DETECT_EVERY == 0:
+                boxes = finder.find(frame)
+            else:
+                boxes = []
+                last = finder._last_box
+                if last is not None:
+                    boxes = [last]
+            for box in boxes:
+                region = _expand(box, width, height)
+                if region[2] == 0:
+                    continue
+                frame = _enhance_roi(frame, region)
+                touched += 1
+            if GRAIN_SIGMA > 0:
+                # Grain goes over the whole frame: applying it only inside the
+                # face box leaves a visible texture boundary at the ROI edge.
+                noise = np.random.default_rng(index).normal(0.0, GRAIN_SIGMA, frame.shape)
+                frame = np.clip(frame.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+            encode.stdin.write(frame.tobytes())
+            index += 1
+    finally:
+        if encode.stdin is not None:
+            encode.stdin.close()
+        decode.stdout.close() if decode.stdout else None
+        decode.wait(timeout=120)
+        encode.wait(timeout=600)
+    if index == 0:
+        shutil.copy2(input_path, output_path)
+        print("[face_refine] 没有读到帧，原样复制", flush=True)
+        return
+    # Keep the original soundtrack: the picture is re-encoded, the audio is
+    # copied stream for stream.
+    mux = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-i", str(temp), "-i", str(input_path),
+         "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "copy", "-c:a", "copy",
+         "-shortest", str(output_path)],
+        capture_output=True, text=True, timeout=600)
+    temp.unlink(missing_ok=True)
+    if mux.returncode != 0:
+        shutil.copy2(input_path, output_path)
+        print(f"[face_refine] 合流失败，原样复制：{mux.stderr.strip()[:200]}", flush=True)
+        return
+    print(f"[face_refine] {finder.backend} 检测到 {touched} 个人脸区域 / {index} 帧，已写出 {output_path.name}",
+          flush=True)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 3:
+        print("用法：face_refine.py input.mp4 output.mp4", file=sys.stderr)
+        return 2
+    input_path, output_path = Path(argv[1]), Path(argv[2])
+    if not input_path.is_file():
+        print(f"找不到输入视频：{input_path}", file=sys.stderr)
+        return 2
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    refine(input_path, output_path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
