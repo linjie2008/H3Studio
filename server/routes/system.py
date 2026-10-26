@@ -41,7 +41,7 @@ def get_settings_hub_asset(req, path, parts, url):
 
 def get_api_version(req, path, parts, url):
     """原 app.py 分支：`path == "/api/version"`。"""
-    req.json(200, {"version": "independent-93"})
+    req.json(200, {"version": "independent-94"})
     return
 
 
