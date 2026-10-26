@@ -16,6 +16,7 @@ from runner import remerge_run
 from runner import run_project
 from server.config import COMFY_DIR
 from server.support import delete_projects
+from server.support import sync_generated_multiview_names
 from store import ASSETS
 from store import OUTPUTS
 from store import align_dimension
@@ -496,6 +497,7 @@ def put_api_projects(req, path, parts, url):
         renumber_project_image_references(project, active_image_ids)
         project["_data_version"] = expected_version + 1
         data["projects"][parts[2]] = project
+        sync_generated_multiview_names(data, parts[2])
         reconcile_run_shot_references(data, project)
     change(save)
     req.json(200, project)

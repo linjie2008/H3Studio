@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from multiview import COMFY_OUTPUT, _model_config, wait_for_image
-from runner import COMFY_INPUT, _submit, update_run
+from runner import COMFY_INPUT, _submit, update_run, release_idle_comfy_after_job
 from store import ASSETS, change, read, uid
 
 
@@ -128,3 +128,4 @@ def generate(job_id: str) -> None:
     finally:
         if source_input and (completed or not submitted):
             source_input.unlink(missing_ok=True)
+        release_idle_comfy_after_job(job_id)

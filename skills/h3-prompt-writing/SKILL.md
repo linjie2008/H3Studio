@@ -187,6 +187,12 @@ The official structure says nothing about density, but density is what actually 
 
 In this workbench a shot keeps its reference image only when the prompt contains an authored tag such as `<Picture 3>` matching the project's `reference_image_numbers`. A "cleaned up" description without the tag silently drops every reference and the run fails with 「参考素材模式需要至少一个参考文件」. Always keep the tag inside the description (e.g. `the campus shown in <Picture 3>`) and keep `N` consistent with the project's numbering.
 
+### [LOCAL] Identity across continued shots
+
+When a later shot changes people, bind that shot's own person image and keep shared scene or vehicle images in their scene or object roles. A shared scene or vehicle reference is not evidence that the person stayed the same. Check both the project-wide `<Picture N>` tags and the shot-local image slots shown by the workbench; the engine remaps the numbers before sending them to H3.
+
+The previous clip's tail is a visual condition, not merely a text cue. If it still shows the outgoing person's face or clothes, a longer continuation guide can overpower the new person image. Inspect the actual outgoing frames and the media passed to H3; use a short scene-only tail where available, while keeping the camera path, background and motion coherent. If the media conditions are wrong, fix the bindings or handoff in the workbench or runner. Repeating "different person" in prose cannot repair them.
+
 ## Full-Reference Mode
 
 Ref2VA rewrites use `subject_definitions`, `summary`, `retention_analysis`, `detailed_description`, `overall_soundscape`, and `non_diegetic_music` in that order. Reference labels stay consistent across all sections. Read `references/ref-en.txt` for label rules, retention analysis, and complete examples.

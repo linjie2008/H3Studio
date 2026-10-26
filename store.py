@@ -82,7 +82,7 @@ def _normalize(data: dict) -> dict:
             character.setdefault("xb_thinking", False)
             character.setdefault("xb_preset_text", "")
             character.setdefault("xb_extra_settings", "")
-            character.setdefault("xb_green_background", True)
+            character.setdefault("xb_green_background", False)
             try:
                 number = int(character.get("subject_number", 0))
             except (ValueError, TypeError):

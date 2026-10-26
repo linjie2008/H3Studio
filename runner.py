@@ -1000,6 +1000,40 @@ def _comfy_queue_is_idle() -> tuple[bool, str]:
         return False, f"无法确认 ComfyUI 队列状态，跳过显存清理：{error}"
 
 
+def release_idle_comfy_after_job(run_id: str) -> None:
+    """Unload models after the whole director job, keeping multi-shot cache warm."""
+    global _ACTIVE_MODEL_FAMILY, _ACTIVE_MODEL_RUN_ID
+    try:
+        with _MODEL_SWITCH_LOCK:
+            state = read()
+            if any(item.get("id") != run_id and item.get("status") in
+                   ("queued", "running", "awaiting_upscale")
+                   for item in state["runs"].values()):
+                status, message = "skipped_queue_busy", "下一个导演台任务已排队，暂不卸载模型"
+            else:
+                idle, detail = _comfy_queue_is_idle()
+                if not idle:
+                    status, message = "skipped_queue_busy", detail + "，暂不卸载模型"
+                else:
+                    _release_comfy_memory()
+                    _ACTIVE_MODEL_FAMILY = None
+                    _ACTIVE_MODEL_RUN_ID = None
+                    status, message = "released", "整次任务结束且 ComfyUI 空闲，已请求卸载模型并释放内存和显存"
+        update_run(run_id, memory_cleanup=message)
+        def record(data):
+            job = data["runs"].get(run_id)
+            if job is not None:
+                job.setdefault("memory_events", []).append({
+                    "time": time.time(), "status": status, "message": message,
+                    "queue": "ComfyUI 队列空闲" if status == "released" else message})
+        change(record)
+    except Exception as error:
+        try:
+            update_run(run_id, memory_cleanup=f"任务结束后释放模型失败：{error}")
+        except Exception:
+            pass
+
+
 def _vram_is_under_pressure() -> tuple[bool, str]:
     """Return whether ComfyUI's first CUDA device has less than 15% or 2 GiB free."""
     try:
@@ -2210,6 +2244,7 @@ def run_project(run_id: str) -> None:
         native_take = _native_take_shot(shots, project)
         if native_take:
             _run_native_take(run_id, native_take, project, assets, output_dir, len(shots))
+            release_idle_comfy_after_job(run_id)
             return
         update_run(run_id, render_strategy="segmented_continuation" if len(shots) > 1 else "single_shot")
         reused_shot_ids: list[str] = []
@@ -2567,3 +2602,4 @@ def run_project(run_id: str) -> None:
     except Exception as error:
         status = "cancelled" if str(error) == "用户取消任务" else "error"
         update_run(run_id, status=status, error=str(error), finished_at=time.time(), results=results)
+    release_idle_comfy_after_job(run_id)

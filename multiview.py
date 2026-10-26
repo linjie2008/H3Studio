@@ -13,7 +13,7 @@ import urllib.error
 import urllib.parse
 from pathlib import Path
 
-from runner import COMFY_INPUT, api, _submit, update_run
+from runner import COMFY_INPUT, api, _submit, update_run, release_idle_comfy_after_job
 from store import ASSETS, change, read, uid
 
 
@@ -242,13 +242,14 @@ def build_qwen_graph(source_name: str | None, preset: str, job_id: str,
         raise ValueError("多视图生成模式无效")
     model, clip, vae = _model_config()
     form = character_form(appearance, settings)
+    green_background = (settings or {}).get("green_background", False) not in (False, "false", 0, "0")
     prompt, width, height = _sheet_prompt(source_name, view_layout, appearance, form)
     graph = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": model, "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": clip, "type": "qwen_image", "device": "default"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": vae}},
         "4": {"class_type": "EmptyImage", "inputs": {"width": width, "height": height,
-                                                     "batch_size": 1, "color": 65280}},
+                                                     "batch_size": 1, "color": 65280 if green_background else 16777215}},
         "6": {"class_type": "TextEncodeQwenImage21", "inputs": {
             "clip": ["2", 0],
             "vae": ["3", 0], "prompt": prompt,
@@ -263,7 +264,8 @@ def build_qwen_graph(source_name: str | None, preset: str, job_id: str,
         "9": {"class_type": "SaveImage", "inputs": {
             "images": ["8", 0], "filename_prefix": "h3studio_multiview_" + job_id}},
     }
-    _attach_green_background(graph, ["8", 0], "9", width, height)
+    if green_background:
+        _attach_green_background(graph, ["8", 0], "9", width, height)
     if source_name:
         graph["5"] = {"class_type": "LoadImage", "inputs": {"image": source_name}}
         graph["6"]["inputs"]["images.image_1"] = ["4", 0]
@@ -365,7 +367,7 @@ def build_xb_qwen_graph(source_name: str | None, preset: str, job_id: str,
     model, clip, vae = _model_config()
     options = settings or {}
     form = character_form(appearance, options)
-    green_background = options.get("green_background", True) not in (False, "false", 0, "0")
+    green_background = options.get("green_background", False) not in (False, "false", 0, "0")
     workflow = _xb_i2i_workflow_defaults() if source_name else {}
     config = dict(workflow) if source_name else dict(options)
     # Studio's character controls take precedence over the saved workflow 69.
@@ -463,7 +465,8 @@ def build_xb_qwen_graph(source_name: str | None, preset: str, job_id: str,
         graph["10"] = {"class_type": "ImageResizeKJv2", "inputs": {
             "image": ["9", 0], "width": width, "height": height,
             "upscale_method": "lanczos", "keep_proportion": "pad",
-            "pad_color": "0, 255, 0", "crop_position": "center",
+            "pad_color": "0, 255, 0" if green_background else "255, 255, 255",
+            "crop_position": "center",
             "divisible_by": 1, "device": "cpu"}}
         reference_image = ["10", 0]
         graph["4"]["inputs"]["resolution"] = 0
@@ -735,3 +738,4 @@ def generate(job_id: str) -> None:
         # portrait into ComfyUI's input folder on every attempt.
         if source_input:
             source_input.unlink(missing_ok=True)
+        release_idle_comfy_after_job(job_id)

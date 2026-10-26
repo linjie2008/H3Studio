@@ -130,7 +130,8 @@ class ProfileImageGraphTests(unittest.TestCase):
 
     def test_character_requirements_override_template_defaults(self):
         with patch.object(multiview, "_model_config", return_value=("model", "clip", "vae")):
-            graph = multiview.build_graph("portrait.png", "fast", "job", "绿幕背景；换成飞行员制服")
+            graph = multiview.build_graph("portrait.png", "fast", "job", "绿幕背景；换成飞行员制服",
+                                          settings={"green_background": True})
         prompt = graph["6"]["inputs"]["prompt"]
         self.assertTrue(prompt.startswith("MANDATORY USER CHARACTER REQUIREMENTS"))
         self.assertIn("绿幕背景；换成飞行员制服", prompt)
@@ -144,6 +145,13 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertEqual(graph["201"]["inputs"]["color"], 65280)
         self.assertEqual(graph["9"]["inputs"]["images"], ["202", 0])
 
+    def test_legacy_qwen_sheet_defaults_to_white_canvas_without_green_matte(self):
+        with patch.object(multiview, "_model_config", return_value=("model", "clip", "vae")):
+            graph = multiview.build_graph("portrait.png", "fast", "white", "角色")
+        self.assertEqual(graph["4"]["inputs"]["color"], 16777215)
+        self.assertNotIn("200", graph)
+        self.assertEqual(graph["9"]["inputs"]["images"], ["8", 0])
+
     def test_mv_adapter_is_no_longer_a_generation_engine(self):
         with self.assertRaisesRegex(ValueError, "生成引擎无效"):
             multiview.build_graph("portrait.png", "fast", "mv", "角色", "five", "mvadapter")
@@ -151,7 +159,8 @@ class ProfileImageGraphTests(unittest.TestCase):
     def test_xb_qwen_reproduces_local_advanced_workflow(self):
         settings = {"output_lang": "zh", "sampling_mode": "on", "skill_mode": "自动",
                     "aspect_ratio": "1:1", "width": 1024, "height": 1024,
-                    "seed": 42, "thinking": False, "extra_settings": "纯绿色背景"}
+                    "seed": 42, "thinking": False, "extra_settings": "纯绿色背景",
+                    "green_background": True}
         with patch.object(multiview, "_require_xb_qwen"), patch.object(
                 multiview, "_model_config", return_value=("model", "clip", "vae")):
             graph = multiview.build_graph(None, "stable", "xb", "红色飞行员制服", "five", "xb_qwen", settings)
@@ -242,11 +251,9 @@ class ProfileImageGraphTests(unittest.TestCase):
         self.assertEqual(graph["4"]["inputs"]["images.image_1"], ["10", 0])
         self.assertEqual(graph["4"]["inputs"]["resolution"], 0)
         self.assertNotIn("images.image_2", graph["4"]["inputs"])
-        self.assertEqual(graph["199"]["inputs"]["image"], ["6", 0])
-        self.assertEqual(graph["201"]["inputs"]["width"], ["199", 1])
-        self.assertEqual(graph["201"]["inputs"]["height"], ["199", 2])
-        self.assertEqual(graph["201"]["inputs"]["color"], 65280)
-        self.assertEqual(graph["7"]["inputs"]["images"], ["202", 0])
+        self.assertNotIn("199", graph)
+        self.assertEqual(graph["10"]["inputs"]["pad_color"], "255, 255, 255")
+        self.assertEqual(graph["7"]["inputs"]["images"], ["6", 0])
         self.assertEqual(graph["5"]["inputs"]["latent_image"], ["4", 2])
 
     def test_xb_qwen_image_mode_honors_character_bypass(self):
@@ -272,12 +279,25 @@ class ProfileImageGraphTests(unittest.TestCase):
                 {"green_background": "false"})
         self.assertNotIn("200", graph)
         self.assertEqual(graph["7"]["inputs"]["images"], ["6", 0])
+        self.assertEqual(graph["10"]["inputs"]["pad_color"], "255, 255, 255")
 
-    def test_xb_qwen_i2i_defaults_to_green_background(self):
+    def test_xb_qwen_i2i_defaults_to_generated_background(self):
         with patch.object(multiview, "_require_xb_qwen"), patch.object(
                 multiview, "_model_config", return_value=("model", "clip", "vae")):
             graph = multiview.build_graph(
-                "portrait.png", "fast", "xb-green", "角色", "four", "xb_qwen", {})
+                "portrait.png", "fast", "xb-default", "角色", "four", "xb_qwen", {})
+        self.assertNotIn("199", graph)
+        self.assertNotIn("200", graph)
+        self.assertEqual(graph["10"]["inputs"]["pad_color"], "255, 255, 255")
+        self.assertEqual(graph["7"]["inputs"]["images"], ["6", 0])
+
+    def test_xb_qwen_i2i_can_explicitly_use_green_background(self):
+        with patch.object(multiview, "_require_xb_qwen"), patch.object(
+                multiview, "_model_config", return_value=("model", "clip", "vae")):
+            graph = multiview.build_graph(
+                "portrait.png", "fast", "xb-green", "角色", "four", "xb_qwen",
+                {"green_background": True})
+        self.assertEqual(graph["10"]["inputs"]["pad_color"], "0, 255, 0")
         self.assertEqual(graph["199"]["inputs"]["image"], ["6", 0])
         self.assertEqual(graph["201"]["inputs"], {
             "width": ["199", 1], "height": ["199", 2],

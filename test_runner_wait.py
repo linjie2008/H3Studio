@@ -34,6 +34,33 @@ class RunnerWaitTests(unittest.TestCase):
         update.assert_called_once()
         self.assertIn("正在重试", update.call_args.kwargs["current"])
 
+    def test_completed_job_releases_models_when_director_and_comfy_are_idle(self):
+        state = {"runs": {"done": {"id": "done", "status": "completed"}}}
+        with patch.object(runner, "read", return_value=state), \
+             patch.object(runner, "_comfy_queue_is_idle", return_value=(True, "空闲")), \
+             patch.object(runner, "_release_comfy_memory") as release, \
+             patch.object(runner, "update_run") as update, \
+             patch.object(runner, "change", side_effect=lambda fn: fn(state)), \
+             patch.object(runner, "_ACTIVE_MODEL_FAMILY", "h3"), \
+             patch.object(runner, "_ACTIVE_MODEL_RUN_ID", "done"):
+            runner.release_idle_comfy_after_job("done")
+            self.assertIsNone(runner._ACTIVE_MODEL_FAMILY)
+            self.assertIsNone(runner._ACTIVE_MODEL_RUN_ID)
+        release.assert_called_once()
+        self.assertIn("已请求卸载", update.call_args.kwargs["memory_cleanup"])
+        self.assertEqual(state["runs"]["done"]["memory_events"][-1]["status"], "released")
+
+    def test_completed_job_keeps_models_for_next_queued_job(self):
+        state = {"runs": {"done": {"id": "done", "status": "completed"},
+                          "next": {"id": "next", "status": "queued"}}}
+        with patch.object(runner, "read", return_value=state), \
+             patch.object(runner, "_release_comfy_memory") as release, \
+             patch.object(runner, "update_run"), \
+             patch.object(runner, "change", side_effect=lambda fn: fn(state)):
+            runner.release_idle_comfy_after_job("done")
+        release.assert_not_called()
+        self.assertEqual(state["runs"]["done"]["memory_events"][-1]["status"], "skipped_queue_busy")
+
 
 if __name__ == "__main__":
     unittest.main()

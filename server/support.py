@@ -101,10 +101,46 @@ def parse_byte_range(header: str, size: int) -> tuple[int, int] | None:
         raise ValueError("invalid byte range")
     return start, end
 
+def generated_multiview_names(state: dict, project_id: str) -> dict[str, str]:
+    """Current display names for automatically named character sheets."""
+    project = state.get("projects", {}).get(project_id) or {}
+    characters = {str(item.get("id") or ""): item for item in project.get("characters", [])}
+    owners = {}
+    for run in state.get("runs", {}).values():
+        if run.get("project_id") == project_id and run.get("kind") == "character_multiview" and run.get("asset_id"):
+            owners[str(run["asset_id"])] = str(run.get("character_id") or "")
+    for character_id, character in characters.items():
+        asset_id = str(character.get("multiview_asset") or "")
+        if asset_id:
+            owners.setdefault(asset_id, character_id)
+    names = {}
+    for asset_id, character_id in owners.items():
+        asset = state.get("assets", {}).get(asset_id) or {}
+        if asset.get("project_id") != project_id or not asset.get("generated_by") or character_id not in characters:
+            continue
+        match = re.fullmatch(r".+ · (四视图|五视图|六视图)", str(asset.get("name") or ""))
+        if match:
+            character_name = str(characters[character_id].get("name") or "未命名角色").strip()
+            names[asset_id] = f"{character_name} · {match.group(1)}"
+    return names
+
+
+def sync_generated_multiview_names(state: dict, project_id: str) -> int:
+    changed = 0
+    for asset_id, name in generated_multiview_names(state, project_id).items():
+        asset = state["assets"][asset_id]
+        if asset.get("name") != name:
+            asset["name"] = name
+            changed += 1
+    return changed
+
+
 def assets_with_character_names(state: dict, project_id: str = "") -> list[dict]:
     """Return project assets annotated with current and historical character owners."""
     projects = state.get("projects", {})
     relevant_ids = [project_id] if project_id else list(projects)
+    display_names = {asset_id: name for current_id in relevant_ids
+                     for asset_id, name in generated_multiview_names(state, current_id).items()}
     owners: dict[str, list[str]] = {}
     character_names: dict[tuple[str, str], str] = {}
     for current_id in relevant_ids:
@@ -134,6 +170,8 @@ def assets_with_character_names(state: dict, project_id: str = "") -> list[dict]
         if (project_id and asset_project != project_id) or (not project_id and asset_project not in projects):
             continue
         item = dict(asset)
+        if item.get("id") in display_names:
+            item["name"] = display_names[item["id"]]
         item["character_names"] = owners.get(str(asset.get("id") or ""), [])
         result.append(item)
     return result
@@ -257,7 +295,7 @@ def make_multiview_job(state: dict, project_id: str, character_id: str, body: di
                 "thinking": character.get("xb_thinking", False),
                 "preset_text": character.get("xb_preset_text", ""),
                 "extra_settings": character.get("xb_extra_settings", ""),
-                "green_background": character.get("xb_green_background", True),
+                "green_background": character.get("xb_green_background", False),
             },
             "status": "queued", "current": "等待 ComfyUI", "created_at": time.time()}
 
