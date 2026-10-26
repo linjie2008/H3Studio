@@ -101,6 +101,8 @@ def post_api_runs_decision(req, path, parts, url):
             run["skip_upscale"] = True
         elif action == "cancel":
             run["cancel_requested"] = True
+            if run.get("status") in ("queued", "running", "awaiting_upscale"):
+                run["current"] = "正在取消任务并停止后处理"
         else:
             raise ValueError("未知任务操作")
         return run

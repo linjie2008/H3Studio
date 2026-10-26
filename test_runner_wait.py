@@ -1,5 +1,8 @@
 import unittest
 import urllib.error
+import sys
+import threading
+import time
 from unittest.mock import patch
 
 import runner
@@ -60,6 +63,21 @@ class RunnerWaitTests(unittest.TestCase):
             runner.release_idle_comfy_after_job("done")
         release.assert_not_called()
         self.assertEqual(state["runs"]["done"]["memory_events"][-1]["status"], "skipped_queue_busy")
+
+    def test_cancel_stops_local_finishing_process_promptly(self):
+        state = {"runs": {"run": {"cancel_requested": False}}}
+        cancel = threading.Timer(0.25, lambda: state["runs"]["run"].update(cancel_requested=True))
+        started = time.monotonic()
+        cancel.start()
+        try:
+            with patch.object(runner, "read", return_value=state):
+                with self.assertRaisesRegex(RuntimeError, "用户取消任务"):
+                    runner._run_cancelable_process(
+                        [sys.executable, "-c", "import time; time.sleep(30)"],
+                        "run", timeout=35)
+        finally:
+            cancel.join()
+        self.assertLess(time.monotonic() - started, 3)
 
 
 if __name__ == "__main__":

@@ -69,7 +69,19 @@ class PostUpscaleTests(unittest.TestCase):
                     patch.object(runner, "_wait", return_value={}), \
                     patch.object(runner, "_download_video", side_effect=download), \
                     patch.object(runner, "subprocess") as process:
-                process.run.side_effect = lambda command, **kwargs: (Path(command[-1]).write_bytes(b"with audio"))
+                # 后处理走 _run_cancelable_process（subprocess.Popen），
+                # 因为超分后的音轨合并必须能被取消。
+                class _FakeProcess:
+                    def __init__(self, command, **kwargs):
+                        self.command = command
+                        Path(command[-1]).write_bytes(b"with audio")
+
+                    def poll(self):
+                        return 0
+
+                    def wait(self, timeout=None):
+                        return 0
+                process.Popen.side_effect = lambda command, **kwargs: _FakeProcess(command, **kwargs)
                 runner.run_post_upscale("job")
             self.assertEqual(data["runs"]["job"]["status"], "completed")
             self.assertEqual(source.read_bytes(), b"original")

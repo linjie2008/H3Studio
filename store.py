@@ -436,6 +436,7 @@ def new_shot() -> dict:
     return {
         "id": uid(), "name": "新镜头", "mode": "t2v", "prompt": "", "prompt_language": "en",
         "duration": 5, "seed": 42, "selected": True,
+        "upscale": False,
         "first_image": None, "last_image": None, "source_video": None,
         "source_start": 0, "ref_images": [], "manual_ref_images": [],
         "ref_videos": [], "ref_audios": [],

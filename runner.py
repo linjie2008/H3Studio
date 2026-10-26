@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -1000,6 +1001,43 @@ def _comfy_queue_is_idle() -> tuple[bool, str]:
         return False, f"无法确认 ComfyUI 队列状态，跳过显存清理：{error}"
 
 
+def _check_run_cancelled(run_id: str) -> None:
+    if read()["runs"].get(run_id, {}).get("cancel_requested"):
+        raise RuntimeError("用户取消任务")
+
+
+def _run_cancelable_process(command: list[str], run_id: str, *, timeout: float,
+                            env: dict | None = None, stdout=None) -> None:
+    """Stop a long local finishing pass promptly when its director run is cancelled."""
+    process = subprocess.Popen(command, env=env, stdout=stdout, start_new_session=True)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            _check_run_cancelled(run_id)
+            code = process.poll()
+            if code is not None:
+                if code:
+                    raise subprocess.CalledProcessError(code, command)
+                return
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(command, timeout)
+            time.sleep(0.25)
+    finally:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+
+
 def release_idle_comfy_after_job(run_id: str) -> None:
     """Unload models after the whole director job, keeping multi-shot cache warm."""
     global _ACTIVE_MODEL_FAMILY, _ACTIVE_MODEL_RUN_ID
@@ -1178,10 +1216,10 @@ def run_post_upscale(run_id: str) -> None:
             raise RuntimeError("SeedVR2 输出尺寸未超过原片，已保留原成片")
         # SeedVR2 processes pictures. Keep the original soundtrack on the new video.
         with_audio = output_dir / "post_upscaled_audio.mp4"
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(output),
-                        "-i", str(source), "-map", "0:v:0", "-map", "1:a:0?",
-                        "-c:v", "copy", "-c:a", "aac", "-shortest", str(with_audio)],
-                       check=True, timeout=300)
+        _run_cancelable_process(["ffmpeg", "-y", "-loglevel", "error", "-i", str(output),
+                                 "-i", str(source), "-map", "0:v:0", "-map", "1:a:0?",
+                                 "-c:v", "copy", "-c:a", "aac", "-shortest", str(with_audio)],
+                                run_id, timeout=300)
         with_audio.replace(output)
         relative = str(output.relative_to(OUTPUTS))
         result = {"file": relative, "source_file": run["source_file"]}
@@ -1195,7 +1233,7 @@ def run_post_upscale(run_id: str) -> None:
                        "output_width": upscaled_size[0], "output_height": upscaled_size[1],
                        "file": relative})
     except Exception as error:
-        status = "cancelled" if "用户取消任务" in str(error) else "error"
+        status = "cancelled" if read()["runs"].get(run_id, {}).get("cancel_requested") else "error"
         update_run(run_id, status=status, error=str(error), finished_at=time.time(),
                    current="已有成片超分失败", active_stage="", active_shot_id="")
 
@@ -1844,7 +1882,8 @@ def _smooth_handoff_motion(previous: Path, current: Path, target: Path,
         return None, None, 0
 
 
-def _audio_mode(video: Path, source_video: Path | None, mode: str) -> None:
+def _audio_mode(video: Path, source_video: Path | None, mode: str,
+                run_id: str | None = None) -> None:
     if mode not in ("source", "mute"):
         return
     temp = video.with_name(video.stem + "_audio.mp4")
@@ -1855,11 +1894,15 @@ def _audio_mode(video: Path, source_video: Path | None, mode: str) -> None:
                    "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "copy", "-c:a", "aac", "-shortest", str(temp)]
     else:
         return
-    subprocess.run(command, check=True, timeout=300)
+    if run_id:
+        _run_cancelable_process(command, run_id, timeout=300)
+    else:
+        subprocess.run(command, check=True, timeout=300)
     temp.replace(video)
 
 
-def _write_merge_audio(videos: list[Path], target: Path) -> None:
+def _write_merge_audio(videos: list[Path], target: Path,
+                       run_id: str | None = None) -> None:
     """Join decoded samples at the exact segment boundaries, without overlap.
 
     A sample clock avoids concat-demuxer timestamp rounding and AAC priming
@@ -1883,10 +1926,14 @@ def _write_merge_audio(videos: list[Path], target: Path) -> None:
                 command += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
             command += ["-af", f"aresample=48000,apad=whole_len={samples},atrim=end_sample={samples}",
                         "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", "-f", "s16le", "pipe:1"]
-            subprocess.run(command, stdout=master, check=True, timeout=600)
+            if run_id:
+                _run_cancelable_process(command, run_id, stdout=master, timeout=600)
+            else:
+                subprocess.run(command, stdout=master, check=True, timeout=600)
 
 
-def _fit_output_size(video: Path, output_dir: Path, index: int, project: dict) -> Path:
+def _fit_output_size(video: Path, output_dir: Path, index: int, project: dict,
+                     run_id: str | None = None) -> Path:
     """Rescale the finished shot to the exact delivery size.
 
     H3's native canvas is 1344x768 (1.75:1), so a 16:9 delivery comes out of
@@ -1905,16 +1952,19 @@ def _fit_output_size(video: Path, output_dir: Path, index: int, project: dict) -
     vf = (f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
           f"crop={target_w}:{target_h}:(iw-{target_w})/2:(ih-{target_h})/2,"
           "setsar=1")
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-threads", "2", "-i", str(video),
-                    "-vf", vf, "-filter_threads", "2", "-c:v", "libx264", "-threads", "2",
-                    "-preset", "fast", "-crf", "17",
-                    "-pix_fmt", "yuv420p", "-c:a", "copy", str(fitted)],
-                   check=True, timeout=900)
+    command = ["ffmpeg", "-y", "-loglevel", "error", "-threads", "2", "-i", str(video),
+               "-vf", vf, "-filter_threads", "2", "-c:v", "libx264", "-threads", "2",
+               "-preset", "fast", "-crf", "17", "-pix_fmt", "yuv420p", "-c:a", "copy", str(fitted)]
+    if run_id:
+        _run_cancelable_process(command, run_id, timeout=900)
+    else:
+        subprocess.run(command, check=True, timeout=900)
     # 不覆盖原文件：checkpoint 里的「H3 原片」必须还是原始采样结果。
     return fitted
 
 
-def _merge(videos: list[Path], target: Path, width: int, height: int) -> None:
+def _merge(videos: list[Path], target: Path, width: int, height: int,
+           run_id: str | None = None) -> None:
     """把分镜拼成一条片。
 
     画布以素材实际尺寸为准，而不是项目画布：开了超分后每个镜头是
@@ -1948,19 +1998,25 @@ def _merge(videos: list[Path], target: Path, width: int, height: int) -> None:
                     "-c:v", "libx264", "-preset", "fast", "-crf", "18",
                     "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
                     "-shortest", str(output)]
-        subprocess.run(command, check=True, timeout=600)
+        if run_id:
+            _run_cancelable_process(command, run_id, timeout=600)
+        else:
+            subprocess.run(command, check=True, timeout=600)
         normalized.append(output)
     manifest = target.with_suffix(".txt")
     manifest.write_text("".join("file '" + str(path).replace("'", "'\\''") + "'\n" for path in normalized))
     audio_master = target.with_suffix(".audio.s16le")
     try:
-        _write_merge_audio(videos, audio_master)
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
-                        "-i", str(manifest), "-f", "s16le", "-ar", "48000", "-ac", "2",
-                        "-i", str(audio_master), "-map", "0:v:0", "-map", "1:a:0",
-                        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                        "-ar", "48000", "-ac", "2", "-movflags", "+faststart",
-                        str(target)], check=True, timeout=600)
+        _write_merge_audio(videos, audio_master, run_id)
+        command = ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                   "-i", str(manifest), "-f", "s16le", "-ar", "48000", "-ac", "2",
+                   "-i", str(audio_master), "-map", "0:v:0", "-map", "1:a:0",
+                   "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                   "-ar", "48000", "-ac", "2", "-movflags", "+faststart", str(target)]
+        if run_id:
+            _run_cancelable_process(command, run_id, timeout=600)
+        else:
+            subprocess.run(command, check=True, timeout=600)
     finally:
         audio_master.unlink(missing_ok=True)
         manifest.unlink(missing_ok=True)
@@ -2201,7 +2257,7 @@ def _run_native_take(run_id: str, shot: dict, project: dict, assets: dict,
         raise RuntimeError("用户取消任务")
     video = output_dir / "merged.mp4"
     _download_video(history, video, f"h3_studio_{run_id}_native")
-    _audio_mode(video, None, shot.get("audio_mode", "generate"))
+    _audio_mode(video, None, shot.get("audio_mode", "generate"), run_id)
     update_run(run_id, merged=str(video.relative_to(OUTPUTS)), progress=f"{shot_count}/{shot_count}",
                results=[{"shot_id": shot["id"], "file": str(video.relative_to(OUTPUTS)),
                          "native_take": True}], status="completed", current="", finished_at=time.time(),
@@ -2482,18 +2538,23 @@ def run_project(run_id: str) -> None:
                         raise RuntimeError("用户取消任务")
             # 先裁到交付尺寸，再在人脸恢复：这样脸部检测和细节恢复都作用在
             # 最终分辨率上（1080p 下脸约 194px，4K 下约 388px）。
+            _check_run_cancelled(run_id)
             continuity_source = final
-            final = _fit_output_size(final, output_dir, index, project)
+            final = _fit_output_size(final, output_dir, index, project, run_id)
+            _check_run_cancelled(run_id)
             if project.get("face_refine"):
                 refined = output_dir / f"shot_{index:03d}_face.mp4"
                 face_python = os.environ.get("H3_STUDIO_FACE_PYTHON", "/home/administrator/ComfyUI/venv/bin/python")
                 env = dict(os.environ)
                 env["H3_STUDIO_FACE_USE_ESRGAN"] = "1"
-                subprocess.run([face_python, str(Path(__file__).with_name("face_refine.py")),
-                                str(final), str(refined)], check=True, timeout=3600, env=env)
+                update_run(run_id, current=shot["name"] + " · 人脸细节增强中（可取消）")
+                _run_cancelable_process([face_python, str(Path(__file__).with_name("face_refine.py")),
+                                         str(final), str(refined)], run_id, timeout=3600, env=env)
                 refined.replace(final)
+            _check_run_cancelled(run_id)
             source = COMFY_INPUT / media[shot["source_video"]] if shot.get("source_video") else None
-            _audio_mode(final, source, shot.get("audio_mode", "generate"))
+            _audio_mode(final, source, shot.get("audio_mode", "generate"), run_id)
+            _check_run_cancelled(run_id)
             previous = continuity_source
             previous_signature = signature
             plan = shot.get("_h3_trim_plan") or {}
@@ -2568,7 +2629,7 @@ def run_project(run_id: str) -> None:
             if len(merge_items) > 1:
                 merged = output_dir / "merged.mp4"
                 _merge(merge_items, merged, int(project.get("width", 1024)),
-                       int(project.get("height", 576)))
+                       int(project.get("height", 576)), run_id)
                 update_run(run_id, merged=str(merged.relative_to(OUTPUTS)),
                            merge_seam_algorithm="adaptive_structural_v5",
                            merge_seam_adjustments=seams)
@@ -2592,7 +2653,7 @@ def run_project(run_id: str) -> None:
             if merge_items:
                 merged = output_dir / "merged.mp4"
                 _merge(merge_items, merged,
-                       int(project.get("width", 1024)), int(project.get("height", 576)))
+                       int(project.get("width", 1024)), int(project.get("height", 576)), run_id)
                 update_run(run_id, merged=str(merged.relative_to(OUTPUTS)),
                            merge_seam_algorithm="adaptive_structural_v7_continuous_audio", merge_seam_adjustments=seam_adjustments,
                            omitted_shots=omitted)
@@ -2600,6 +2661,6 @@ def run_project(run_id: str) -> None:
                    active_stage="", active_shot_id="", active_prefix="",
                    reused_shot_ids=reused_shot_ids)
     except Exception as error:
-        status = "cancelled" if str(error) == "用户取消任务" else "error"
+        status = "cancelled" if read()["runs"].get(run_id, {}).get("cancel_requested") else "error"
         update_run(run_id, status=status, error=str(error), finished_at=time.time(), results=results)
     release_idle_comfy_after_job(run_id)

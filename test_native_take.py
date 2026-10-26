@@ -65,6 +65,9 @@ class NativeTakeTests(unittest.TestCase):
         self.assertIsNone(_native_take_shot(project["shots"], project))
         project["shots"] = [first, new_shot()]
         self.assertEqual(shot_refine_mode(project["shots"][1], project), "latent")
+        # 新镜头默认不跟随项目的超分开关，要继承必须显式清掉这个覆盖值。
+        self.assertFalse(shot_upscale(project["shots"][1], project))
+        project["shots"][1]["upscale"] = None
         self.assertTrue(shot_upscale(project["shots"][1], project))
         project["generation_speed"] = "goldfish"
         self.assertEqual(shot_refine_mode(second, project), "off")
