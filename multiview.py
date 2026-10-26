@@ -568,11 +568,23 @@ def _output_paths(history: dict, node_id: str) -> list[Path]:
     return paths
 
 
+def _job_state(job_id: str) -> dict:
+    """Return the job record without exploding when it was removed mid-run.
+
+    A missing record used to raise KeyError out of the worker thread, which
+    left the job stuck in "running" and blocked every later task for the
+    whole project.
+    """
+    try:
+        return (read().get("runs") or {}).get(job_id) or {}
+    except Exception:
+        return {}
+
 def wait_for_image(prompt_id: str, job_id: str) -> dict:
     failures = 0
     missing_checks = 0
     while True:
-        if read()["runs"][job_id].get("cancel_requested"):
+        if _job_state(job_id).get("cancel_requested"):
             try:
                 api("/api/jobs/" + urllib.parse.quote(prompt_id, safe="") + "/cancel", {})
             except (OSError, RuntimeError):
@@ -633,11 +645,10 @@ def wait_for_image(prompt_id: str, job_id: str) -> dict:
 
 
 def generate(job_id: str) -> None:
-    job = read()["runs"][job_id]
     source_input = None
-    submitted = False
     completed = False
     try:
+        job = read()["runs"][job_id]
         if job.get("source_asset"):
             source = read()["assets"][job["source_asset"]]
             source_path = ASSETS / source["file"]
@@ -656,9 +667,8 @@ def generate(job_id: str) -> None:
         graph = build_graph(source_input.name if source_input else None, job["preset"],
                             job_id, str(job.get("appearance") or ""), view_layout, engine,
                             job.get("xb_settings") if isinstance(job.get("xb_settings"), dict) else None)
-        if read()["runs"][job_id].get("cancel_requested"):
+        if _job_state(job_id).get("cancel_requested"):
             raise RuntimeError("用户取消多视图任务")
-        submitted = True
         prompt_id = _submit(graph, job_id)
         update_run(job_id, status="running", prompt_id=prompt_id,
                    current=f"{engine_label} {view_label}生成中")
@@ -712,8 +722,16 @@ def generate(job_id: str) -> None:
             raise RuntimeError(f"角色已变化，{view_label}生成结果未保存")
         completed = True
     except Exception as error:
-        update_run(job_id, status="cancelled" if read()["runs"][job_id].get("cancel_requested") else "error",
-                   error=str(error), finished_at=time.time())
+        try:
+            update_run(job_id, status="cancelled" if _job_state(job_id).get("cancel_requested") else "error",
+                       error=str(error), finished_at=time.time())
+        except Exception:
+            # The job record can disappear while the workflow runs.  Recording
+            # the failure must not raise out of the worker thread either.
+            pass
     finally:
-        if source_input and (completed or not submitted):
+        # The input copy only matters while the workflow runs.  Leaving it
+        # behind after a failure or a cancellation leaks another copy of the
+        # portrait into ComfyUI's input folder on every attempt.
+        if source_input:
             source_input.unlink(missing_ok=True)

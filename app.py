@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import mimetypes
 import os
@@ -187,7 +188,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def same_origin_request(self) -> bool:
         host = self.headers.get("Host", "")
-        return bool(host and self.headers.get("Origin") in (f"http://{host}", f"https://{host}"))
+        origin = self.headers.get("Origin", "")
+        if not host or origin not in (f"http://{host}", f"https://{host}"):
+            return False
+        # Matching Origin against Host is not enough: an attacker page that
+        # resolves its own domain to 127.0.0.1 sends Host and Origin of the
+        # same foreign name, so the check passes.  Only accept a host that
+        # points back at this machine or the local network.
+        hostname = host.rsplit(":", 1)[0] if ":" in host else host
+        hostname = hostname.strip("[]").lower()
+        if hostname in ("localhost", "127.0.0.1", "::1", socket.gethostname().lower()):
+            return True
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            return False
+        return address.is_loopback or address.is_private
 
     def file(self, path: Path) -> None:
         if not path.is_file():
@@ -235,7 +251,20 @@ class Handler(BaseHTTPRequestHandler):
         route.handler(self, path, parts, url)
 
     def do_GET(self) -> None:
-        self.dispatch("GET")
+        try:
+            self.dispatch("GET")
+        except (ValueError, KeyError, TypeError, AttributeError, OverflowError,
+                zipfile.BadZipFile) as error:
+            # Without this the handler thread dies and the browser only sees a
+            # dropped connection, so a bad project or pack looks like a network
+            # failure instead of the problem it is.
+            self.log_error("GET %s failed: %s: %s",
+                           urllib.parse.urlsplit(self.path).path, type(error).__name__, error)
+            self.json(400, {"error": str(error)})
+        except (OSError, urllib.error.URLError, RuntimeError, subprocess.SubprocessError) as error:
+            self.log_error("GET %s failed: %s: %s",
+                           urllib.parse.urlsplit(self.path).path, type(error).__name__, error)
+            self.json(502, {"error": str(error)})
 
     def do_POST(self) -> None:
         if not self.same_origin_request():
@@ -243,7 +272,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             self.dispatch("POST")
-        except (ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
+        except (ValueError, KeyError, TypeError, AttributeError, OverflowError,
+                zipfile.BadZipFile) as error:
             self.json(400, {"error": str(error)})
         except (OSError, urllib.error.URLError, RuntimeError, subprocess.SubprocessError) as error:
             path = urllib.parse.urlsplit(self.path).path
@@ -257,7 +287,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             self.dispatch("PUT")
-        except (ValueError, KeyError, TypeError) as error:
+        except (ValueError, KeyError, TypeError, AttributeError, OverflowError) as error:
             # 保存失败的原因必须留痕：前端只弹一个 toast，日志里没有就查不出来。
             self.log_error("PUT %s rejected: %s: %s",
                            urllib.parse.urlsplit(self.path).path, type(error).__name__, error)

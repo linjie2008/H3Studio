@@ -164,7 +164,7 @@ def project_snapshot(state: dict, project: dict, shot_id: str = "") -> dict:
             "ref_background": shot.get("ref_background") or "auto",
             "refine_mode": shot.get("refine_mode") if shot.get("refine_mode") is not None else project.get("refine_mode", "off"),
             "upscale": shot.get("upscale") if shot.get("upscale") is not None else bool(project.get("upscale")),
-            "picture_tags": sorted({int(value) for value in re.findall(r"<Picture\s+(\d+)>", prompt)}),
+            "picture_tags": sorted({int(value) for value in re.findall(r"<Picture\s*(\d+)>", prompt)}),
             "has_source_video": bool(shot.get("source_video")),
             "ref_images": list(shot.get("ref_images") or []),
             "character_ids": list(shot.get("character_ids") or []),

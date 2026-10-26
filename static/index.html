@@ -1260,9 +1260,9 @@ function ensureImageReferenceNumbers(schedule=true){
  if(JSON.stringify(numbers)!==JSON.stringify(next)){
   const livePrompt=$('prompt'),liveShot=livePrompt?.dataset.shotId===activeShotId&&livePrompt?.dataset.editorProjectId===project.id?project.shots?.find(shot=>shot.id===activeShotId):null;
   if(livePrompt&&liveShot&&liveShot.prompt!==livePrompt.value)liveShot.prompt=livePrompt.value;
-  const rewrite=value=>String(value||'').replace(/<Picture\s+(\d+)>|@图片\s*(\d+)/gi,(tag,picture,atPicture)=>{
-   const number=Number(picture||atPicture),replacement=oldToNew.get(number);
-   if(replacement)return atPicture?`@图片${replacement}`:`<Picture ${replacement}>`;
+  const rewrite=value=>String(value||'').replace(/<Picture\s*(\d+)>|@图片\s*(\d+)|(?<![<@])图片\s*(\d+)/gi,(tag,picture,atPicture,plain)=>{
+   const number=Number(picture||atPicture||plain),replacement=oldToNew.get(number);
+   if(replacement)return atPicture||plain?`@图片${replacement}`:`<Picture ${replacement}>`;
    return deleted.has(number)?'':tag;
   });
   project.shared_prompt=rewrite(project.shared_prompt);
@@ -1275,12 +1275,12 @@ function ensureImageReferenceNumbers(schedule=true){
 function projectImageReferenceNumber(id){const value=Number(ensureImageReferenceNumbers()[id]);return Number.isInteger(value)&&value>0?value:0}
 function wbActiveCharacterIds(s){
  const ids=s.character_ids||[];if(ids.length<=1)return ids;
- const numbers=new Set([...String(s.prompt||'').matchAll(/<Picture\s+(\d+)>|@图片\s*(\d+)/gi)].map(match=>Number(match[1]||match[2])));
+ const numbers=new Set([...String(s.prompt||'').matchAll(/<Picture\s*(\d+)>|@图片\s*(\d+)|(?<![<@])图片\s*(\d+)/gi)].map(match=>Number(match[1]||match[2]||match[3])));
  const matching=ids.filter(id=>{const c=(project.characters||[]).find(item=>item.id===id);return c&&[c.portrait_asset,c.multiview_asset].some(assetId=>assetId&&numbers.has(projectImageReferenceNumber(assetId)))});
  return matching.length===1?matching:ids;
 }
 function wbReferenceIds(s,kind){const shared=project?.shared_refs||{},ids=[...(shared[{image:'images',video:'videos',audio:'audios'}[kind]]||[]),...(s[{image:'ref_images',video:'ref_videos',audio:'ref_audios'}[kind]]||[])];if(kind==='image'&&['r2v','rv2v'].includes(s.mode)){for(const id of wbActiveCharacterIds(s)){const c=(project.characters||[]).find(x=>x.id===id);if(c?.portrait_asset)ids.push(c.portrait_asset);if(c?.multiview_asset)ids.push(c.multiview_asset)}for(const id of s.entity_ids||[]){const entity=(project.entities||[]).find(x=>x.id===id);ids.push(...(entity?.image_assets||[]))}}if(kind==='audio'&&s.audio_mode!=='mute'&&['r2v','rv2v'].includes(s.mode)){for(const id of s.character_ids||[]){const c=(project.characters||[]).find(x=>x.id===id);if(c?.voice_asset)ids.push(c.voice_asset)}}if(kind==='audio'&&s.audio_mode==='mute')return[];if(kind==='video'&&['v2v','rv2v'].includes(s.mode)&&s.source_video)ids.unshift(s.source_video);return [...new Set(ids)]}
-function pictureReferencePattern(id){const number=projectImageReferenceNumber(id);return number>0?new RegExp(`<Picture\\s*${number}\\s*>|@图片\\s*${number}(?!\\d)`,'gi'):null}
+function pictureReferencePattern(id){const number=projectImageReferenceNumber(id);return number>0?new RegExp(`<Picture\\s*${number}\\s*>|@图片\\s*${number}(?!\\d)|(?<![<@])图片\\s*${number}(?!\\d)`,'gi'):null}
 function promptReferencesImage(s,id){const pattern=pictureReferencePattern(id);return !!pattern&&pattern.test(String(s.prompt||''))}
 function wbImageBinding(s,id){
   const mentioned=promptReferencesImage(s,id),manual=(s.manual_ref_images||[]).includes(id);
@@ -1757,7 +1757,7 @@ function updateOptimizationButtons(){
 function previousPromptImages(shot){
  const numbers=ensureImageReferenceNumbers(),byNumber=Object.fromEntries(Object.entries(numbers).map(([id,n])=>[Number(n),id]));
  const ids=[shot.first_image,shot.last_image,...(shot.ref_images||[])].filter(Boolean);
- for(const match of String(shot.prompt||'').matchAll(/<Picture\s+(\d+)>|@图片\s*(\d+)/gi)){
+ for(const match of String(shot.prompt||'').matchAll(/<Picture\s*(\d+)>|@图片\s*(\d+)/gi)){
   const id=byNumber[Number(match[1]||match[2])];if(id)ids.push(id);
  }
  return [...new Set(ids)].filter(id=>assets.some(a=>a.id===id&&a.kind==='image'));
@@ -1806,7 +1806,7 @@ async function applyReusePrompt(){
   mapping.set(id,target);
  }
  const numbers=ensureImageReferenceNumbers(),byNumber=Object.fromEntries(Object.entries(numbers).map(([id,n])=>[Number(n),id]));
- const rewritten=String(previous.prompt||'').replace(/<Picture\s+(\d+)>|@图片\s*(\d+)/gi,(tag,picture,mention)=>{
+ const rewritten=String(previous.prompt||'').replace(/<Picture\s*(\d+)>|@图片\s*(\d+)/gi,(tag,picture,mention)=>{
   const sourceId=byNumber[Number(picture||mention)],targetId=mapping.get(sourceId);
   if(!targetId)return tag;
   const number=numbers[targetId];return picture?`<Picture ${number}>`:`@图片${number}`;
@@ -1819,7 +1819,7 @@ async function applyReusePrompt(){
    const result=await request('/api/enhance','POST',{prompt:rewritten,mode:previous.mode,skill_id:currentPromptSkill().id,duration:previous.duration||current.duration,project_id:state.projectId,shot_id:state.currentId,output_language:previous.prompt_language||'en',optimization_scope:'沿用上一镜头换图专用：保留原提示词中的故事、场景、物件、动作、逐秒时间轴、镜头构图、运镜、节奏、声音与对白，不得改动这些内容。彻底删除上一张参考图对应人物的身份、年龄、脸型、发型、身材、服装、颜色、配饰等外观描述及其冲突细节；人物外观和服装一律以当前镜头新绑定的参考图为准，只保留简短指令“人物外观（包括服装与配饰）严格以当前绑定参考图为准”，不要猜测或编造新人物特征。保留已经替换完成的所有图片引用标签。'});
    if(project?.id!==state.projectId||!project.shots.some(item=>item.id===state.currentId))return;
    if(!String(result.prompt||'').trim())throw Error('AI 返回空提示词');
-   finalPrompt=String(result.prompt).replace(/<Picture\s+(\d+)>|@图片\s*(\d+)/gi,(tag,picture,mention)=>{
+   finalPrompt=String(result.prompt).replace(/<Picture\s*(\d+)>|@图片\s*(\d+)/gi,(tag,picture,mention)=>{
     const sourceId=byNumber[Number(picture||mention)],targetId=mapping.get(sourceId);
     if(!targetId)return tag;
     const number=numbers[targetId];return picture?`<Picture ${number}>`:`@图片${number}`;

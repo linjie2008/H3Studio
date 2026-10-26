@@ -45,7 +45,7 @@ RISK_LABEL = {RISK_READ: "只读", RISK_WRITE: "自动执行（可回滚）",
 
 TOOLS: dict[str, dict] = {}
 
-PICTURE_TAG = re.compile(r"<Picture\s+(\d+)>", re.IGNORECASE)
+PICTURE_TAG = re.compile(r"<Picture\s*(\d+)>", re.IGNORECASE)
 
 
 def tool(name: str, risk: str, summary: str, args: dict | None = None):

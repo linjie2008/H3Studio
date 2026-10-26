@@ -25,6 +25,7 @@ from store import new_project
 from store import new_shot
 from store import project_asset_ids
 from store import read
+from store import reconcile_run_shot_references
 from store import reserve_runs
 from store import uid
 from timeline_ops import edit_timeline
@@ -495,6 +496,7 @@ def put_api_projects(req, path, parts, url):
         renumber_project_image_references(project, active_image_ids)
         project["_data_version"] = expected_version + 1
         data["projects"][parts[2]] = project
+        reconcile_run_shot_references(data, project)
     change(save)
     req.json(200, project)
 

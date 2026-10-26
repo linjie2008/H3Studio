@@ -6,7 +6,57 @@ import copy
 import re
 
 
-_PICTURE_TAG = re.compile(r"<Picture\s+(\d+)>|@图片\s*(\d+)", re.IGNORECASE)
+# Every place that reads a picture alias must accept the same spellings.  The
+# plain Chinese 「图片N」 used to be understood by the prompt rewriter but not
+# by the binder, so a shot could carry a <Picture N> tag with no image behind
+# it — and the number then silently pointed at whatever image sat in that
+# slot.  One regex keeps the writer and the binder in agreement.
+_PICTURE_TAG = re.compile(r"<Picture\s*(\d+)>|@图片\s*(\d+)|(?<![<@])图片\s*(\d+)", re.IGNORECASE)
+
+
+def picture_numbers(text: str) -> list[int]:
+    """Return every picture number the text references, in order of appearance."""
+    numbers: list[int] = []
+    for match in _PICTURE_TAG.finditer(str(text or "")):
+        value = next((group for group in match.groups() if group), None)
+        if value:
+            numbers.append(int(value))
+    return numbers
+
+
+def picture_tag_matches(text: str) -> list[re.Match]:
+    """Every picture alias in the text, with its position for context windows."""
+    return list(_PICTURE_TAG.finditer(str(text or "")))
+
+
+def normalize_picture_aliases(text: str) -> str:
+    """Canonicalize a plain 「图片N」 into the @图片N form the whole app reads."""
+    def replace(match: re.Match) -> str:
+        if match.group(3) is None:
+            return match.group(0)
+        return f"@图片{match.group(3)}"
+    return _PICTURE_TAG.sub(replace, str(text or ""))
+
+
+def rewrite_picture_tags(text: str, mapping: dict[int, int], unbound=None) -> str:
+    """Rewrite picture aliases to local slot numbers.
+
+    ``mapping`` maps a project-wide number to the local H3 slot.  A number
+    without a local slot must never keep its raw value: it would bind to
+    whichever image happens to occupy that slot.  ``unbound(number)`` may
+    return a replacement string; returning None keeps the original text.
+    """
+    def replace(match: re.Match) -> str:
+        number = int(next(group for group in match.groups() if group))
+        local = mapping.get(number)
+        if local is not None:
+            return f"<Picture {local}>"
+        if unbound is not None:
+            replacement = unbound(number)
+            if replacement is not None:
+                return replacement
+        return match.group(0)
+    return _PICTURE_TAG.sub(replace, str(text or ""))
 
 
 def normalized_project_image_references(project: dict, assets: dict) -> dict:
@@ -51,7 +101,7 @@ def renumber_project_image_references(project: dict, active_image_ids: list[str]
 
     def rewrite(text: str) -> str:
         def replace(match: re.Match) -> str:
-            number = int(match.group(1) or match.group(2))
+            number = int(next(group for group in match.groups() if group))
             is_at_alias = match.group(2) is not None
             if number in old_to_new:
                 return f"@图片{old_to_new[number]}" if is_at_alias else f"<Picture {old_to_new[number]}>"
@@ -61,10 +111,10 @@ def renumber_project_image_references(project: dict, active_image_ids: list[str]
         return _PICTURE_TAG.sub(replace, text)
 
     if "shared_prompt" in project:
-        project["shared_prompt"] = rewrite(str(project.get("shared_prompt") or ""))
+        project["shared_prompt"] = rewrite(normalize_picture_aliases(str(project.get("shared_prompt") or "")))
     for shot in project.get("shots", []):
         if "prompt" in shot:
-            shot["prompt"] = rewrite(str(shot.get("prompt") or ""))
+            shot["prompt"] = rewrite(normalize_picture_aliases(str(shot.get("prompt") or "")))
         if isinstance(shot.get("manual_ref_images"), list):
             shot["manual_ref_images"] = [asset_id for asset_id in shot["manual_ref_images"]
                                          if asset_id in active]
@@ -82,17 +132,18 @@ def synchronize_project_image_bindings(project: dict) -> None:
                  if str(number).isdigit() and int(number) > 0}
     shared = set((project.get("shared_refs") or {}).get("images") or [])
     for shot in project.get("shots", []):
-        if shot.get("mode") not in ("r2v", "rv2v"):
+        if shot.get("mode") not in ("r2v", "rv2v", "v2v"):
             continue
-        numbers = [int(match.group(1) or match.group(2)) for match in
-                   _PICTURE_TAG.finditer(str(shot.get("prompt") or ""))]
+        numbers = picture_numbers(str(shot.get("prompt") or ""))
         if not numbers:
             shot["ref_images"] = []
             continue
         missing = [number for number in numbers if number not in by_number]
         if missing:
             # The runner reports the invalid alias instead of silently sending
-            # a different image occupying the same local H3 slot.
+            # a different image occupying the same local H3 slot.  Drop the
+            # stale selection so nothing unbound reaches the model either.
+            shot["ref_images"] = []
             continue
         tagged = [by_number[number] for number in numbers if by_number[number] not in shared]
         shot["ref_images"] = list(dict.fromkeys(tagged))
@@ -121,7 +172,7 @@ def assign_single_image_per_shot(project: dict, assignments: dict[str, str]) -> 
 
         def replace(match: re.Match) -> str:
             nonlocal replaced
-            source_number = int(match.group(1) or match.group(2))
+            source_number = int(next(group for group in match.groups() if group))
             if by_number.get(source_number) in shared:
                 return match.group(0)
             replaced = True

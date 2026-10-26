@@ -27,7 +27,7 @@ def align_dimension(value, default: int) -> int:
     """Return the nearest positive multiple of 32, preferring lower on ties."""
     try:
         number = max(32, int(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         number = int(default)
     lower = max(32, number // 32 * 32)
     upper = lower + 32
@@ -48,7 +48,9 @@ def _normalize(data: dict) -> dict:
     for project in data.get("projects", {}).values():
         for key, value in defaults.items():
             if key not in project:
-                project[key] = value
+                # Every project needs its own copy: sharing the template's lists
+                # lets one project's characters show up in another project's.
+                project[key] = deepcopy(value)
         project["width"] = align_dimension(project.get("width"), defaults["width"])
         project["height"] = align_dimension(project.get("height"), defaults["height"])
         used = set()
@@ -206,6 +208,31 @@ def active_run(data: dict, exclude_id: str = "") -> dict | None:
     """Return a director task that has not finished all of its processing."""
     return next((run for run in data["runs"].values()
                  if run.get("id") != exclude_id and run.get("status") in ACTIVE_RUN_STATUSES), None)
+
+
+def reconcile_run_shot_references(data: dict, project: dict) -> None:
+    """Point older runs at the shots that replaced them.
+
+    Merging shots drops the absorbed ids from the project.  The runs kept the
+    old ids, so their results became unreachable and a reroll of the merged
+    shot could no longer find the run it came from.
+    """
+    remap = {}
+    for shot in project.get("shots") or []:
+        for absorbed in shot.get("_merged_shot_ids") or []:
+            if absorbed and shot.get("id"):
+                remap[absorbed] = shot["id"]
+    if not remap:
+        return
+    for run in (data.get("runs") or {}).values():
+        if run.get("project_id") != project.get("id"):
+            continue
+        shot_ids = run.get("shot_ids")
+        if isinstance(shot_ids, list):
+            run["shot_ids"] = [remap.get(item, item) for item in shot_ids]
+        for result in run.get("results") or []:
+            if result.get("shot_id") in remap:
+                result["shot_id"] = remap[result["shot_id"]]
 
 
 def reserve_runs(runs: list[dict]) -> dict | None:

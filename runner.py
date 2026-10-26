@@ -22,6 +22,9 @@ from pathlib import Path
 from engine import build_h3_graph, build_seedvr2_graph, director_control_text
 from memory_plan import fit_canvas, plan_canvas
 from reference_numbering import normalized_project_image_references
+from reference_numbering import picture_numbers
+from reference_numbering import picture_tag_matches
+from reference_numbering import rewrite_picture_tags
 from store import ASSETS, OUTPUTS, change, read
 from video_tools import dimensions as video_dimensions
 from video_tools import duration as video_duration
@@ -214,8 +217,7 @@ def prepare_shot(original: dict, project: dict) -> dict:
                 next_number += 1
     authored_text = "\n".join((str(project.get("shared_prompt") or ""),
                                str(original.get("prompt") or "")))
-    requested_numbers = {int(match.group(1) or match.group(2)) for match in
-                         re.finditer(r"<Picture\s+(\d+)>|@图片\s*(\d+)", authored_text, re.IGNORECASE)}
+    requested_numbers = set(picture_numbers(authored_text))
     number_to_asset = {}
     for asset_id, number in image_numbers.items():
         asset = catalog.get(asset_id, {})
@@ -226,7 +228,7 @@ def prepare_shot(original: dict, project: dict) -> dict:
                 raise ValueError(f"镜头 {shot.get('name', '')} 的图片编号 {value} 对应多张素材，请刷新素材编号")
             number_to_asset.setdefault(value, asset_id)
     missing_numbers = sorted(requested_numbers - number_to_asset.keys())
-    if missing_numbers and shot.get("mode") in {"r2v", "rv2v"}:
+    if missing_numbers and shot.get("mode") in {"r2v", "rv2v", "v2v"}:
         raise ValueError(f"镜头 {shot.get('name', '')} 引用了不存在的图片编号：{missing_numbers[0]}")
     requested_assets = {number_to_asset[number] for number in requested_numbers if number in number_to_asset}
     # Gallery selection is only a visual planning marker. Only an authored
@@ -234,7 +236,7 @@ def prepare_shot(original: dict, project: dict) -> dict:
     # must not silently introduce unmentioned people or objects.  Video editing
     # needs the same rule: a leftover gallery image would occupy a slot the
     # prompt then reads as a different reference.
-    if shot.get("mode") in {"r2v", "rv2v"}:
+    if shot.get("mode") in {"r2v", "rv2v", "v2v"}:
         shot["ref_images"] = [asset_id for asset_id in shot.get("ref_images") or []
                               if asset_id in requested_assets]
     for source, destination in (("images", "ref_images"), ("videos", "ref_videos"), ("audios", "ref_audios")):
@@ -255,9 +257,7 @@ def prepare_shot(original: dict, project: dict) -> dict:
     # character selection inherited from an earlier group shot. Otherwise all
     # selected faces are sent to H3 and marked as appearing in this segment.
     if len(selected_profiles) > 1:
-        authored_numbers = {int(match.group(1) or match.group(2)) for match in
-                            re.finditer(r"<Picture\s+(\d+)>|@图片\s*(\d+)",
-                                        str(original.get("prompt") or ""), re.IGNORECASE)}
+        authored_numbers = set(picture_numbers(str(original.get("prompt") or "")))
         authored_assets = {number_to_asset[number] for number in authored_numbers
                            if number in number_to_asset}
         matched_profiles = [profile for profile in selected_profiles
@@ -390,7 +390,7 @@ def prepare_shot(original: dict, project: dict) -> dict:
     # its asset to this shot. Otherwise the prompt contains a label H3 cannot
     # resolve because no corresponding image was actually sent in ref_images,
     # and the number silently points at whichever image owns that slot.
-    if shot.get("mode") in reference_modes:
+    if shot.get("mode") in reference_modes | {"v2v"}:
         for number in sorted(requested_numbers):
             asset_id = number_to_asset.get(number)
             if asset_id and catalog.get(asset_id, {}).get("kind") == "image":
@@ -421,16 +421,25 @@ def prepare_shot(original: dict, project: dict) -> dict:
                        for asset_id, number in image_numbers.items()
                        if asset_id in local_image_numbers and str(number).isdigit()}
 
+    unbound_picture_numbers: list[int] = []
+
+    def unbound_picture(number: int):
+        """A picture number with no local slot must not keep its raw value.
+
+        Leaving it untouched lets the number bind to whichever image happens
+        to occupy that slot, which is how a prompt asking for one reference
+        ends up showing another one.  Drop the tag and report it instead.
+        """
+        if 1 <= number <= len(local_image_numbers):
+            unbound_picture_numbers.append(number)
+            return ""
+        return None
+
     def localize_picture_tags(text: str) -> str:
-        def localize(match):
-            number = int(next(group for group in match.groups() if group))
-            local = global_to_local.get(number, number)
-            return f"<Picture {local}>"
         # Also normalize the plain Chinese alias 「图片N」, which users type in the
         # shared prompt; H3 only understands <Picture N>, so an un-normalized
         # alias leaves the reference unbound in the description.
-        return re.sub(r"<Picture\s+(\d+)>|@图片\s*(\d+)|(?<![<@])图片\s*(\d+)",
-                      localize, text, flags=re.IGNORECASE)
+        return rewrite_picture_tags(text, global_to_local, unbound_picture)
 
     # H3 numbers the edited source video as <Video 1> and any extra reference
     # videos after it.  A hand-edited prompt can drift to a number that has no
@@ -453,6 +462,8 @@ def prepare_shot(original: dict, project: dict) -> dict:
     authored_shot_prompt = localize_video_tags(localize_picture_tags(str(shot.get("prompt") or "").strip()))
     prompt_parts = [authored_shared_prompt, *annotations, *entity_annotations, authored_shot_prompt]
     shot["prompt"] = "\n".join(part for part in prompt_parts if part)
+    if unbound_picture_numbers:
+        shot["_h3_unbound_picture_tags"] = sorted(set(unbound_picture_numbers))
     return shot
 
 
@@ -460,6 +471,12 @@ def prepare_shot(original: dict, project: dict) -> dict:
 # 步数策略等），就把它加一位，让旧成片缓存自动失效——否则同一份镜头设置会命中旧缓存，
 # 把“改完引擎却没重新生成”的旧片段拼回成片。
 WORKFLOW_REVISION = "h3studio_graph_rev_2026_10_24_depth_identity_roles"
+
+# Shot fields that only exist while a shot runs. They must never reach the
+# cache key: their values change between two identical runs.
+_RUNTIME_ONLY_SHOT_KEYS = frozenset((
+    "scene_id", "_h3_memory_plan", "_h3_trim_plan", "_h3_entry_flash",
+))
 
 
 def shot_refine_mode(shot: dict, project: dict) -> str:
@@ -506,7 +523,11 @@ def _shot_signature(shot: dict, project: dict, assets: dict, previous_signature:
     asset_state = {asset_id: {key: assets.get(asset_id, {}).get(key) for key in ("file", "name", "kind")}
                    for asset_id in sorted(ids)}
     continuity_from = previous_signature if shot.get("continuity") else None
-    render_shot = {key: value for key, value in shot.items() if key != "scene_id"}
+    # Runtime-only annotations do not describe the shot. A VRAM reading in here
+    # changes on every run, so under the automatic memory policy every shot
+    # would get a fresh cache key and never be reused.
+    render_shot = {key: value for key, value in shot.items()
+                   if key not in _RUNTIME_ONLY_SHOT_KEYS}
     payload = json.dumps({"shot": render_shot, "project": relevant_project, "assets": asset_state,
                           "continuity_from": continuity_from},
                          ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
@@ -596,9 +617,8 @@ def _shot_identity_refs(shot: dict, project: dict, assets: dict) -> list[str]:
                        if str(number).isdigit() and asset_id in assets}
     def tagged_refs(item: dict) -> list[str]:
         text = "\n".join((str(project.get("shared_prompt") or ""), str(item.get("prompt") or "")))
-        return list(dict.fromkeys(number_to_asset[number] for match in
-                  re.finditer(r"<Picture\s+(\d+)>|@图片\s*(\d+)", text, re.IGNORECASE)
-                  if (number := int(match.group(1) or match.group(2))) in number_to_asset))
+        return list(dict.fromkeys(number_to_asset[number] for number in picture_numbers(text)
+                                  if number in number_to_asset))
     authored_refs = tagged_refs(shot)
     refs = list(dict.fromkeys([*(project.get("shared_refs", {}).get("images", []) or []),
                                *authored_refs, *profile_refs]))
@@ -607,11 +627,12 @@ def _shot_identity_refs(shot: dict, project: dict, assets: dict) -> list[str]:
                     "男孩", "女孩", "飞行员", "士兵", "person", "character", "protagonist",
                     "portrait", "man", "woman", "pilot", "soldier", "identity")
     explicit_person_refs = set()
-    for match in re.finditer(r"<Picture\s+(\d+)>|@图片\s*(\d+)", prompt_text, re.IGNORECASE):
+    for match in picture_tag_matches(prompt_text):
+        number = int(next(group for group in match.groups() if group))
         nearby = prompt_text[max(0, match.start() - 20):min(len(prompt_text), match.end() + 20)].lower()
         if not any(term in nearby for term in person_terms):
             continue
-        asset_id = number_to_asset.get(int(match.group(1) or match.group(2)))
+        asset_id = number_to_asset.get(number)
         if asset_id and not is_non_person(asset_id):
             explicit_person_refs.add(asset_id)
             if asset_id not in refs:
@@ -865,6 +886,18 @@ def _submit(graph: dict, run_id: str | None = None) -> str:
                 response = api("/prompt", {"prompt": graph, "client_id": client_id,
                                            "extra_data": {"preview_method": "auto"}})
                 break
+            except urllib.error.HTTPError as error:
+                # A rejected prompt is a permanent error, not a transient one.
+                # Retrying it only burns a minute per shot and hides the reason
+                # behind a generic network message.
+                detail = ""
+                try:
+                    payload = json.loads(error.read().decode("utf-8", "replace"))
+                    node_errors = payload.get("node_errors") or {}
+                    detail = json.dumps(node_errors, ensure_ascii=False)
+                except Exception:
+                    detail = getattr(error, "reason", "") or str(error)
+                raise RuntimeError(f"ComfyUI 拒绝了任务（HTTP {error.code}）：{detail[:2000]}") from error
             except (TimeoutError, urllib.error.URLError, ConnectionError) as error:
                 if read()["runs"].get(run_id or "", {}).get("cancel_requested"):
                     raise RuntimeError("用户取消任务") from error
@@ -898,9 +931,14 @@ def _prompt_state(prompt_id: str) -> str:
         return "unavailable"
 
 
-def _resume_prompt(run_id: str, stage: str, shot_id: str) -> str | None:
+def _resume_prompt(run_id: str, stage: str, shot_id: str, signature: str | None = None) -> str | None:
     run = read()["runs"][run_id]
     if run.get("active_stage") != stage or run.get("active_shot_id") != shot_id:
+        return None
+    if signature is not None and run.get("active_signature") != signature:
+        # The shot changed after the task was submitted.  Adopting the old
+        # prompt would hand the model a clip made from the previous wording
+        # and cache it under the new signature.
         return None
     prompt_id = str(run.get("prompt_id") or "")
     return prompt_id if _prompt_state(prompt_id) in ("active", "completed") else None
@@ -2101,7 +2139,7 @@ def _native_take_shot(shots: list[dict], project: dict) -> dict | None:
         controls = director_control_text(shot)
         if controls:
             prompt += "\n" + controls
-        prompt = re.sub(r"<Picture\s+(\d+)>", remap, prompt, flags=re.IGNORECASE)
+        prompt = re.sub(r"<Picture\s*(\d+)>", remap, prompt, flags=re.IGNORECASE)
         end = elapsed + float(shots[index].get("duration") or 5)
         parts.append(f"[{elapsed:g}s-{end:g}s] Beat {index + 1}: {prompt}")
         elapsed = end
@@ -2296,7 +2334,7 @@ def run_project(run_id: str) -> None:
             except Exception:
                 sampler_info, sampler_label = None, ""
             if checkpoint.get("signature") != signature or not first_pass.is_file() or (pre_refine and not pre_refine.is_file()):
-                prompt_id = _resume_prompt(run_id, "h3", shot["id"])
+                prompt_id = _resume_prompt(run_id, "h3", shot["id"], signature)
                 if not prompt_id:
                     graph = build_h3_graph(shot, render_settings, media, prefix)
                     if sampler_info:
@@ -2309,6 +2347,7 @@ def run_project(run_id: str) -> None:
                     prompt_id = _submit(graph, run_id)
                     update_run(run_id, prompt_id=prompt_id, active_stage="h3",
                                active_shot_id=shot["id"], active_prefix=prefix,
+                               active_signature=signature,
                                current=shot["name"] + " · H3 视频生成中"
                                + (f"（{sampler_label}）" if sampler_label else ""))
                 else:

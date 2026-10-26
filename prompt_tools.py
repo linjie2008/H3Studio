@@ -20,7 +20,7 @@ DEEPSEEK_MODEL = os.environ.get("H3_STUDIO_DEEPSEEK_MODEL", "deepseek-flash")
 MIMO_URL = os.environ.get("H3_STUDIO_MIMO_URL", "https://api.xiaomimimo.com/v1/chat/completions")
 MIMO_MODEL = os.environ.get("H3_STUDIO_MIMO_MODEL", "mimo-v2.6-pro")
 CREATIVE_MODES = {"t2v", "i2v", "fl2v"}
-_MEDIA_TAG = re.compile(r"<(Picture|Video|Audio)\s+(\d+)>|@图片\s*(\d+)", re.IGNORECASE)
+_MEDIA_TAG = re.compile(r"<(Picture|Video|Audio)\s*(\d+)>|@图片\s*(\d+)", re.IGNORECASE)
 _completion_status_lock = threading.Lock()
 _completion_status = {"ok": None, "checked_at": 0.0, "message": ""}
 
@@ -492,7 +492,7 @@ Return only the rewritten shot description in the requested language."""
         text = _creative_prompt_without_reference_tags(text, context, output_language)
     text = _preserve_inline_spoken_text(authored_prompt, text)
     text = strip_shot_markers(text)
-    tag_pattern = re.compile(r"<(?:Picture|Video|Audio)\s+\d+>")
+    tag_pattern = re.compile(r"<(?:Picture|Video|Audio)\s*\d+>")
     required_tags, allowed_tags = _reference_tag_sets(
         authored_prompt, (reference_context or {}).get("references"))
     output_tags = set(tag_pattern.findall(text))
@@ -512,7 +512,7 @@ def _valid_reference_numbers(references) -> dict:
             continue
         # The tag itself is authoritative: the context's "type" field is
         # lowercase ("image"), the tag prefix is not ("<Picture 1>").
-        match = re.match(r"<(Picture|Video|Audio)\s+(\d+)>", str(ref.get("tag") or ""))
+        match = re.match(r"<(Picture|Video|Audio)\s*(\d+)>", str(ref.get("tag") or ""))
         if match:
             numbers[match.group(1)].add(int(match.group(2)))
     return numbers
@@ -527,7 +527,7 @@ def _reference_tag_sets(authored: str, references) -> tuple[set, set]:
     reproducing it verbatim.  Tags that do have material behind them are real
     bindings and must survive the rewrite untouched.
     """
-    pattern = re.compile(r"<(?:Picture|Video|Audio)\s+\d+>")
+    pattern = re.compile(r"<(?:Picture|Video|Audio)\s*\d+>")
     valid = _valid_reference_numbers(references)
     required = set()
     for tag in pattern.findall(authored):
@@ -654,7 +654,7 @@ Selected Skill:
         raise RuntimeError("AI 两次返回的分镜仍不完整；原提示词未更改，请减少单次统筹的镜头数")
 
     results = []
-    tag_pattern = re.compile(r"<(?:Picture|Video|Audio)\s+\d+>")
+    tag_pattern = re.compile(r"<(?:Picture|Video|Audio)\s*\d+>")
     for source, item in zip(shots, items):
         authored = item["description"]
         text = _strip_generated_motion_overlay(by_id[item["id"]])

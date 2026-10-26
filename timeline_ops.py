@@ -40,7 +40,16 @@ def edit_timeline(shots: list[dict], shot_ids: list[str], action: str, value=Non
         raise ValueError("只能合并时间轴上连续的镜头")
 
     group = [shots[index] for index in indexed]
-    total_duration = sum(float(shot.get("duration") or 0) for shot in group)
+    durations = []
+    for shot in group:
+        try:
+            duration = float(shot.get("duration") or 0)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"镜头“{shot.get('name', '')}”的时长必须是数字") from error
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError(f"镜头“{shot.get('name', '')}”的时长无效；合并前请先修正")
+        durations.append(duration)
+    total_duration = sum(durations)
     if not 2 <= total_duration <= 15:
         raise ValueError("合并后时长必须在 2 到 15 秒之间；请先调整时长")
     same_fields = (
@@ -51,15 +60,24 @@ def edit_timeline(shots: list[dict], shot_ids: list[str], action: str, value=Non
         "dialogue_time", "dialogue_voiceover", "dialogue_cutoff", "dialogue_carries_out",
         "on_screen_text", "overall_soundscape", "non_diegetic_music", "ref_image_roles",
         "ref_video_roles", "ref_audio_roles",
+        # These change what the shot sends to H3.  Merging kept only the first
+        # shot's copy, so a second shot's manual reference images, official
+        # time anchors, person swap or LoRA settings were dropped silently.
+        "manual_ref_images", "h3_guides", "replace_person", "swap_lora",
+        "faceswap_trigger_only", "ref_background", "continuity", "prompt_language",
+        "guide_mode", "refine_mode", "upscale", "continuity_video", "source_end",
     )
     first = group[0]
     for field in same_fields:
         if any(shot.get(field) != first.get(field) for shot in group[1:]):
             raise ValueError(f"镜头的“{field}”设置不一致；为避免丢失素材或声音信息，不能合并")
-    timed_prompts = []
-    cursor = 0.0
     for shot in group:
         duration = float(shot.get("duration") or 0)
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError(f"镜头“{shot.get('name', '')}”的时长无效；合并前请先修正")
+    timed_prompts = []
+    cursor = 0.0
+    for shot, duration in zip(group, durations):
         prompt = str(shot.get("prompt") or "").strip()
         if not prompt:
             raise ValueError("待合并镜头都需要填写提示词")
@@ -69,6 +87,9 @@ def edit_timeline(shots: list[dict], shot_ids: list[str], action: str, value=Non
     merged["name"] = "合并镜头"
     merged["duration"] = total_duration
     merged["prompt"] = "\n".join(timed_prompts)
+    # Keep the absorbed ids so the saved project can point the old runs and
+    # results at the merged shot instead of leaving dangling references.
+    merged["_merged_shot_ids"] = [shot["id"] for shot in group[1:] if shot.get("id")]
     result = copy.deepcopy(shots)
     result[indexed[0]:indexed[-1] + 1] = [merged]
     return result

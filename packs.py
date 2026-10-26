@@ -10,42 +10,42 @@ from pathlib import Path
 
 from engine import h3_frames
 from store import ASSETS, ROOT, change, new_project, new_shot, read, uid
+from store import project_asset_ids as store_project_asset_ids
 
 PACKS = ROOT / "packs"
 PACKS.mkdir(exist_ok=True)
 
 
 def project_asset_ids(project: dict) -> set[str]:
-    ids = set()
-    for group in project.get("shared_refs", {}).values():
-        ids.update(group or [])
-    for character in project.get("characters", []):
-        for key in ("portrait_asset", "multiview_asset", "voice_asset"):
-            if character.get(key):
-                ids.add(character[key])
-    for entity in project.get("entities", []):
-        ids.update(entity.get("image_assets") or [])
-        if entity.get("generation_source"):
-            ids.add(entity["generation_source"])
-    for shot in project.get("shots", []):
-        for key in ("first_image", "last_image", "source_video"):
-            if shot.get(key):
-                ids.add(shot[key])
-        for key in ("ref_images", "ref_videos", "ref_audios"):
-            ids.update(shot.get(key) or [])
-    return ids
+    """Every asset the project refers to.
+
+    This must stay the same set the studio collects, otherwise a manual
+    reference image or an official time anchor is left out of the pack and
+    the imported project points at ids that do not exist.
+    """
+    return store_project_asset_ids(project)
 
 
 def export_pack(project_id: str) -> Path:
     data = read()
     project = data["projects"][project_id]
     out = PACKS / (project_id + ".h3pack.zip")
-    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
+    temp = out.with_name(out.name + ".tmp")
+    missing = []
+    with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
         archive.writestr("project.json", json.dumps({"format": "h3-studio-1", "project": project}, ensure_ascii=False))
         for asset_id in sorted(project_asset_ids(project)):
-            asset = data["assets"][asset_id]
+            asset = data["assets"].get(asset_id)
+            # A reference to a deleted asset must not abort the export and
+            # leave a half-written pack behind.
+            if not asset or not (ASSETS / asset["file"]).is_file():
+                missing.append(asset_id)
+                continue
             archive.write(ASSETS / asset["file"], "assets/" + asset["file"])
             archive.writestr("asset_meta/" + asset_id + ".json", json.dumps(asset, ensure_ascii=False))
+    temp.replace(out)
+    if missing:
+        raise ValueError("项目引用了 " + str(len(missing)) + " 个已不存在的素材，无法完整导出：" + missing[0])
     return out
 
 
@@ -158,48 +158,65 @@ def import_pack(source: Path) -> dict:
         if "project.json" not in archive.namelist() and "timeline.json" in archive.namelist():
             return _import_director_pack(archive)
         payload = json.loads(archive.read("project.json"))
-        if payload.get("format") != "h3-studio-1":
+        if not isinstance(payload, dict) or payload.get("format") != "h3-studio-1":
             raise ValueError("不是 H3 Studio 项目包")
+        if not isinstance(payload.get("project"), dict):
+            raise ValueError("项目包内容损坏：缺少项目数据")
         project = copy.deepcopy(payload["project"])
         for key, value in new_project(project.get("name", "导入项目")).items():
             project.setdefault(key, copy.deepcopy(value))
         old_ids = project_asset_ids(project)
         new_assets = {}
         mapping = {}
-        for old_id in old_ids:
-            meta = json.loads(archive.read("asset_meta/" + old_id + ".json"))
-            file_name = meta["file"]
-            if "/" in file_name or "\\" in file_name or file_name in (".", ".."):
-                raise ValueError("项目包包含非法素材路径")
-            new_id = uid()
-            suffix = "." + file_name.rsplit(".", 1)[-1]
-            new_name = new_id + suffix
-            with archive.open("assets/" + file_name) as src, (ASSETS / new_name).open("wb") as dst:
-                shutil.copyfileobj(src, dst, 1024 * 1024)
-            new_assets[new_id] = {**meta, "id": new_id, "file": new_name}
-            mapping[old_id] = new_id
+        written = []
+        try:
+            for old_id in old_ids:
+                meta = json.loads(archive.read("asset_meta/" + old_id + ".json"))
+                file_name = meta["file"]
+                if "/" in file_name or "\\" in file_name or file_name in (".", ".."):
+                    raise ValueError("项目包包含非法素材路径")
+                new_id = uid()
+                suffix = "." + file_name.rsplit(".", 1)[-1]
+                new_name = new_id + suffix
+                with archive.open("assets/" + file_name) as src, (ASSETS / new_name).open("wb") as dst:
+                    shutil.copyfileobj(src, dst, 1024 * 1024)
+                written.append(ASSETS / new_name)
+                new_assets[new_id] = {**meta, "id": new_id, "file": new_name}
+                mapping[old_id] = new_id
+        except Exception:
+            # A half-imported pack must not leave orphan files behind.
+            for path in written:
+                path.unlink(missing_ok=True)
+            raise
     project["id"] = uid()
     project["name"] = project.get("name", "导入项目") + "（导入）"
     for asset in new_assets.values():
         asset["project_id"] = project["id"]
     for key, values in project.get("shared_refs", {}).items():
-        project["shared_refs"][key] = [mapping[item] for item in values]
+        project["shared_refs"][key] = [mapping[item] for item in values if item in mapping]
     for shot in project.get("shots", []):
         shot["id"] = uid()
         for key in ("first_image", "last_image", "source_video"):
             if shot.get(key):
-                shot[key] = mapping[shot[key]]
-        for key in ("ref_images", "ref_videos", "ref_audios"):
-            shot[key] = [mapping[item] for item in shot.get(key, [])]
+                shot[key] = mapping.get(shot[key], "")
+        for key in ("ref_images", "ref_videos", "ref_audios", "manual_ref_images"):
+            shot[key] = [mapping[item] for item in shot.get(key, []) if item in mapping]
+        for guide in shot.get("h3_guides") or []:
+            if isinstance(guide, dict) and guide.get("image_id"):
+                guide["image_id"] = mapping.get(guide["image_id"], "")
         shot.setdefault("character_ids", [])
     for character in project.get("characters", []):
         for key in ("portrait_asset", "multiview_asset", "voice_asset"):
             if character.get(key):
-                character[key] = mapping[character[key]]
+                character[key] = mapping.get(character[key], "")
     for entity in project.get("entities", []):
-        entity["image_assets"] = [mapping[item] for item in entity.get("image_assets", [])]
+        entity["image_assets"] = [mapping[item] for item in entity.get("image_assets", []) if item in mapping]
         if entity.get("generation_source"):
             entity["generation_source"] = mapping.get(entity["generation_source"], "")
+    descriptions = project.get("image_descriptions") or {}
+    project["image_descriptions"] = {
+        mapping[asset_id]: text for asset_id, text in descriptions.items() if asset_id in mapping
+    }
     def save(data):
         data["projects"][project["id"]] = project
         data["assets"].update(new_assets)
