@@ -6,10 +6,11 @@ H3 Studio 自行管理项目、镜头时间轴、素材、任务队列、结果�
 
 ## 启动
 
-在 Ubuntu 终端执行：
+在 Ubuntu 终端进入本目录后执行：
 
 ```bash
-bash /home/administrator/minimax-h3-studio/start.sh
+cd minimax-h3-studio
+bash start.sh
 ```
 
 浏览器打开 `http://127.0.0.1:8765`。服务默认只监听本机回环地址；如确实需要通过 WSL 地址或局域网访问，可显式设置 `H3_STUDIO_HOST=0.0.0.0`，并只在可信网络中使用。软件可以在 ComfyUI 未运行时编辑项目；实际生成需 ComfyUI 在 `http://127.0.0.1:8188` 可用。
@@ -33,7 +34,7 @@ SelfLift、语义桥和 H3 3D latent 放大需要重启一次 ComfyUI，以载�
 
 图生视频在镜头卡片选「图生视频」，再点击「首帧图片」下方的「上传图片」；图片会自动上传并选中。也可先在左侧「素材库」上传，再从镜头的下拉框选择。视频编辑在镜头卡片选 `v2v`，点击「源视频」下方的「上传视频」。多个镜头会按时间轴顺序生成，项目「导出」设为「合并全片」时会自动合并。
 
-若启动或连接失败，运行 `bash /home/administrator/minimax-h3-studio/diagnose.sh` 查看端口和最近日志。
+若启动或连接失败，运行 `bash diagnose.sh` 查看端口和最近日志。
 
 ## 人物清晰度
 

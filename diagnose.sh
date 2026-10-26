@@ -12,7 +12,8 @@ echo "相关进程："
 ps -eo pid,args | rg '[m]ain.py|[a]pp.py|[s]tart.sh' || true
 echo
 echo "最近启动日志："
-for log_file in /home/administrator/minimax-h3-studio/logs/comfyui.log /home/administrator/minimax-h3-studio/logs/studio.log; do
+studio_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for log_file in "$studio_dir/logs/comfyui.log" "$studio_dir/logs/studio.log"; do
     if [ -f "$log_file" ]; then
         echo "$log_file"
         tail -n 12 "$log_file"

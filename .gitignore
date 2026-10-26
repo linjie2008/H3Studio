@@ -3,6 +3,7 @@ __pycache__/
 .venv-agent/
 .venv-translation/
 data/
+outputs/
 logs/
 static/index.html.bak
 static/index.html.bak-20261016

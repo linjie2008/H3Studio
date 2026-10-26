@@ -8,10 +8,11 @@ its own and finishes with the upscale skipped.
 """
 import json
 import sys
+from pathlib import Path
 import threading
 import time
 
-sys.path.insert(0, "/home/administrator/minimax-h3-studio")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runner
 import store
 

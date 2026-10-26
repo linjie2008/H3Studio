@@ -9,8 +9,10 @@ import time
 from pathlib import Path
 
 
-COMFY_DIR = Path("/home/administrator/ComfyUI")
-START_SCRIPT = Path("/home/administrator/start_comfyui.sh")
+import os
+
+COMFY_DIR = Path(os.environ.get("COMFYUI_DIR", "/home/administrator/ComfyUI"))
+START_SCRIPT = Path(os.environ.get("COMFYUI_START_SCRIPT", "/home/administrator/start_comfyui.sh"))
 LOG = COMFY_DIR / "comfyui_boot.log"
 
 
