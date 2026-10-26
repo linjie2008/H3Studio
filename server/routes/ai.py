@@ -5,16 +5,26 @@ from server.router import Route
 
 from ai_config import deepseek_key_source
 from ai_config import mimo_key_source
+from ai_config import minimax_key_source
 from ai_config import prompt_provider
+from ai_config import provider_model
 from ai_config import remove_saved_deepseek_key
 from ai_config import remove_saved_mimo_key
+from ai_config import remove_saved_minimax_key
 from ai_config import save_deepseek_key
 from ai_config import save_mimo_key
+from ai_config import save_provider_model
+from ai_config import save_minimax_key
 from ai_config import save_prompt_provider
 from prompt_tools import DEEPSEEK_MODEL
 from prompt_tools import MIMO_MODEL
+from prompt_tools import MINIMAX_MODEL
+from prompt_tools import deepseek_model
+from prompt_tools import mimo_model
+from prompt_tools import minimax_model
 from prompt_tools import _deepseek_complete_request
 from prompt_tools import _mimo_complete
+from prompt_tools import _minimax_complete
 from prompt_tools import stream_translate_prompt
 from prompt_tools import translate_prompt_with_backend
 from server.support import deepseek_connection_status
@@ -26,12 +36,15 @@ import urllib.error
 def get_api_ai_settings(req, path, parts, url):
     """原 app.py 分支：`path == "/api/ai/settings"`。"""
     source = deepseek_key_source()
-    req.json(200, {"provider": "DeepSeek", "model": DEEPSEEK_MODEL,
+    req.json(200, {"provider": "DeepSeek", "model": deepseek_model(),
                     "configured": source != "none", "key_source": source,
                     "selected_provider": prompt_provider(),
-                    "fallback": {"provider": "小米 MiMo", "model": MIMO_MODEL,
+                    "fallback": {"provider": "小米 MiMo", "model": mimo_model(),
                                  "configured": mimo_key_source() != "none",
-                                 "key_source": mimo_key_source()}})
+                                 "key_source": mimo_key_source()},
+                    "extra_fallback": {"provider": "MiniMax", "model": minimax_model(),
+                                       "configured": minimax_key_source() != "none",
+                                       "key_source": minimax_key_source()}})
     return
 
 
@@ -39,14 +52,14 @@ def get_api_ai_provider(req, path, parts, url):
     """原 app.py 分支：`path == "/api/ai/provider"`。"""
     selected = prompt_provider()
     req.json(200, {"selected_provider": selected,
-                    "options": ["auto", "deepseek", "mimo"]})
+                    "options": ["auto", "deepseek", "mimo", "minimax"]})
     return
 
 
 def get_api_ai_mimo_settings(req, path, parts, url):
     """原 app.py 分支：`path == "/api/ai/mimo/settings"`。"""
     source = mimo_key_source()
-    req.json(200, {"provider": "小米 MiMo", "model": MIMO_MODEL,
+    req.json(200, {"provider": "小米 MiMo", "model": mimo_model(),
                     "configured": source != "none", "key_source": source})
     return
 
@@ -106,7 +119,7 @@ def post_api_ai_test(req, path, parts, url):
         [{"role": "system", "content": "Reply with exactly OK."},
          {"role": "user", "content": "OK"}],
         max_tokens=128, timeout=35)
-    req.json(200, {"ok": True, "provider": "DeepSeek", "model": DEEPSEEK_MODEL,
+    req.json(200, {"ok": True, "provider": "DeepSeek", "model": deepseek_model(),
                     "message": "连接成功，API Key 与模型均可用。"})
     return
 
@@ -120,7 +133,7 @@ def post_api_ai_mimo_test(req, path, parts, url):
         [{"role": "system", "content": "Reply with exactly OK."},
          {"role": "user", "content": "OK"}],
         max_tokens=128, timeout=35)
-    req.json(200, {"ok": True, "provider": "小米 MiMo", "model": MIMO_MODEL,
+    req.json(200, {"ok": True, "provider": "小米 MiMo", "model": mimo_model(),
                     "message": "连接成功，API Key 与模型均可用。"})
     return
 
@@ -182,6 +195,77 @@ def delete_api_ai_mimo_settings(req, path, parts, url):
     return
 
 
+def get_api_ai_minimax_settings(req, path, parts, url):
+    """原 app.py 分支：`path == "/api/ai/minimax/settings"`。"""
+    source = minimax_key_source()
+    req.json(200, {"provider": "MiniMax", "model": minimax_model(),
+                    "configured": source != "none", "key_source": source})
+    return
+
+
+def post_api_ai_minimax_settings(req, path, parts, url):
+    """原 app.py 分支：`path == "/api/ai/minimax/settings"`。"""
+    if not req.same_origin_request():
+        req.json(403, {"error": "请从工作台页面配置云端 AI"})
+        return
+    body = req.body_json()
+    save_minimax_key(body.get("api_key", ""))
+    source = minimax_key_source()
+    req.json(200, {"provider": "MiniMax", "model": minimax_model(),
+                    "configured": source != "none", "key_source": source})
+    return
+
+
+def post_api_ai_minimax_test(req, path, parts, url):
+    """原 app.py 分支：`path == "/api/ai/minimax/test"`。"""
+    if not req.same_origin_request():
+        req.json(403, {"error": "请从工作台页面测试云端 AI"})
+        return
+    _minimax_complete(
+        [{"role": "system", "content": "Reply with exactly OK."},
+         {"role": "user", "content": "OK"}],
+        max_tokens=128, timeout=35)
+    req.json(200, {"ok": True, "provider": "MiniMax", "model": minimax_model(),
+                    "message": "连接成功，API Key 与模型均可用。"})
+    return
+
+
+def delete_api_ai_minimax_settings(req, path, parts, url):
+    """原 app.py 分支：`parts == ["api", "ai", "minimax", "settings"]`。"""
+    remove_saved_minimax_key()
+    source = minimax_key_source()
+    req.json(200, {"provider": "MiniMax", "model": minimax_model(),
+                    "configured": source != "none", "key_source": source})
+    return
+
+
+def get_api_ai_models(req, path, parts, url):
+    """GET /api/ai/models —— 各提供商当前使用的模型与可选清单。"""
+    from ai_config import PROVIDER_MODEL_CATALOG
+    from ai_config import provider_model_source
+    providers = {}
+    for name in ("deepseek", "mimo", "minimax"):
+        providers[name] = {
+            "model": provider_model(name),
+            "source": provider_model_source(name),
+            "catalog": list(PROVIDER_MODEL_CATALOG.get(name, [])),
+        }
+    req.json(200, {"providers": providers})
+    return
+
+
+def post_api_ai_models(req, path, parts, url):
+    """POST /api/ai/models {provider, model} —— 保存自己选择的模型。"""
+    if not req.same_origin_request():
+        req.json(403, {"error": "请从工作台页面配置提示词模型"})
+        return
+    body = req.body_json()
+    provider = str(body.get("provider") or "").strip().lower()
+    model = save_provider_model(provider, body.get("model", ""))
+    req.json(200, {"provider": provider, "model": model, "source": "saved"})
+    return
+
+
 ROUTES = [
     Route('GET', 'get_api_ai_settings',
          lambda path, parts, url: (path == "/api/ai/settings"),
@@ -189,9 +273,15 @@ ROUTES = [
     Route('GET', 'get_api_ai_provider',
          lambda path, parts, url: (path == "/api/ai/provider"),
          get_api_ai_provider),
+    Route('GET', 'get_api_ai_minimax_settings',
+         lambda path, parts, url: (path == "/api/ai/minimax/settings"),
+         get_api_ai_minimax_settings),
     Route('GET', 'get_api_ai_mimo_settings',
          lambda path, parts, url: (path == "/api/ai/mimo/settings"),
          get_api_ai_mimo_settings),
+    Route('GET', 'get_api_ai_models',
+         lambda path, parts, url: (path == "/api/ai/models"),
+         get_api_ai_models),
     Route('GET', 'get_api_ai_status',
          lambda path, parts, url: (path == "/api/ai/status"),
          get_api_ai_status),
@@ -207,6 +297,15 @@ ROUTES = [
     Route('POST', 'post_api_ai_mimo_test',
          lambda path, parts, url: (path == "/api/ai/mimo/test"),
          post_api_ai_mimo_test),
+    Route('POST', 'post_api_ai_minimax_test',
+         lambda path, parts, url: (path == "/api/ai/minimax/test"),
+         post_api_ai_minimax_test),
+    Route('POST', 'post_api_ai_minimax_settings',
+         lambda path, parts, url: (path == "/api/ai/minimax/settings"),
+         post_api_ai_minimax_settings),
+    Route('POST', 'post_api_ai_models',
+         lambda path, parts, url: (path == "/api/ai/models"),
+         post_api_ai_models),
     Route('POST', 'post_api_ai_settings',
          lambda path, parts, url: (path == "/api/ai/settings"),
          post_api_ai_settings),
@@ -216,6 +315,9 @@ ROUTES = [
     Route('POST', 'post_api_ai_mimo_settings',
          lambda path, parts, url: (path == "/api/ai/mimo/settings"),
          post_api_ai_mimo_settings),
+    Route('DELETE', 'delete_api_ai_minimax_settings',
+         lambda path, parts, url: (parts == ["api", "ai", "minimax", "settings"]),
+         delete_api_ai_minimax_settings),
     Route('DELETE', 'delete_api_ai_settings',
          lambda path, parts, url: (parts == ["api", "ai", "settings"]),
          delete_api_ai_settings),

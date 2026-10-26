@@ -129,6 +129,9 @@ async function removeDeepseekKey() {
 const mimoKey = ref('')
 const mimoTestStatus = ref('')
 const mimoTesting = ref(false)
+const minimaxKey = ref('')
+const minimaxTestStatus = ref('')
+const minimaxTesting = ref(false)
 async function saveMimoKey() {
   const key = mimoKey.value.trim()
   if (!key) { ui.toast('请先粘贴小米 MiMo API Key'); return }
@@ -148,11 +151,57 @@ async function testMimo() {
     mimoTestStatus.value = `连接失败：${e.message}`
   } finally { mimoTesting.value = false }
 }
+const modelDrafts = ref({})
+const modelSourceLabel = { saved: '本机选择', environment: '环境变量', default: '内置默认' }
+function modelOptions(provider) {
+  const info = ai.models[provider]
+  if (!info) return []
+  return [...new Set([...(info.catalog || []), info.model].filter(Boolean))]
+}
+function isCustomModel(provider) {
+  const info = ai.models[provider]
+  return Boolean(info) && !modelOptions(provider).includes(info.model)
+}
+async function savePromptModel(provider) {
+  const draft = (modelDrafts.value[provider] ?? '').trim()
+  if (!draft) { ui.toast('请先填写模型名'); return }
+  try {
+    const model = await ai.savePromptModel(provider, draft)
+    ui.toast('已切换到 ' + model)
+  } catch (e) { ui.toast(e.message) }
+}
 async function removeMimoKey() {
   if (!confirm('清除保存在此 WSL 用户下的小米 MiMo API Key？')) return
   try {
     await ai.removeMimoKey()
     ui.toast('已清除小米 MiMo API Key')
+  } catch (e) { ui.toast(e.message) }
+}
+
+async function saveMinimaxKey() {
+  const key = minimaxKey.value.trim()
+  if (!key) { ui.toast('请先粘贴 MiniMax API Key'); return }
+  minimaxKey.value = ''
+  try {
+    await ai.saveMinimaxKey(key)
+    ui.toast('MiniMax API Key 已保存到 WSL 用户私密配置')
+  } catch (e) { ui.toast(e.message); minimaxKey.value = key }
+}
+async function testMinimax() {
+  minimaxTesting.value = true
+  minimaxTestStatus.value = '正在向 MiniMax 发送测试请求…'
+  try {
+    const result = await ai.testMinimax()
+    minimaxTestStatus.value = `连接成功 · ${result.provider} · ${result.model}`
+  } catch (e) {
+    minimaxTestStatus.value = `连接失败：${e.message}`
+  } finally { minimaxTesting.value = false }
+}
+async function removeMinimaxKey() {
+  if (!confirm('清除保存在此 WSL 用户下的 MiniMax API Key？')) return
+  try {
+    await ai.removeMinimaxKey()
+    ui.toast('已清除 MiniMax API Key')
   } catch (e) { ui.toast(e.message) }
 }
 
@@ -163,6 +212,7 @@ async function onProviderChange(event) {
   try {
     const selected = await ai.setProvider(select.value)
     ui.toast(selected === 'mimo' ? '已切换为仅小米 MiMo'
+    : selected === 'minimax' ? '已切换为仅 MiniMax'
       : selected === 'deepseek' ? '已切换为仅 DeepSeek' : '已切换为自动备用模式')
   } catch (e) {
     select.value = previous
@@ -403,6 +453,14 @@ onMounted(async () => { await skills.refresh() })
               {{ deepseekTesting ? '测试中…' : '测试连接' }}</button>
             <button type="button" class="alt" :disabled="!ai.canRemoveDeepseek()" @click="removeDeepseekKey">清除</button>
           </div>
+          <div class="row">
+            <span class="muted">模型</span>
+            <input v-model="modelDrafts.deepseek" type="text" list="deepseekModelList"
+              placeholder="如 deepseek-flash" style="flex:1">
+            <datalist id="deepseekModelList"><option v-for="m in modelOptions('deepseek')" :key="m" :value="m" /></datalist>
+            <button type="button" @click="savePromptModel('deepseek')">保存模型</button>
+          </div>
+          <p class="muted">{{ ai.models.deepseek ? `当前模型：${ai.models.deepseek.model}（${modelSourceLabel[ai.models.deepseek.source] || ai.models.deepseek.source}）` : '' }}</p>
           <p class="muted">{{ ai.status }}</p>
           <p class="muted" aria-live="polite">{{ deepseekTestStatus }}</p>
         </details>
@@ -412,9 +470,10 @@ onMounted(async () => { await skills.refresh() })
           <h3>提示词模型选择</h3>
           <div class="row">
             <select :value="ai.provider" aria-label="提示词模型选择" @change="onProviderChange">
-              <option value="auto">自动 · DeepSeek 优先，MiMo 备用</option>
+              <option value="auto">自动 · DeepSeek 优先，MiMo 与 MiniMax 依次备用</option>
               <option value="deepseek">仅 DeepSeek</option>
               <option value="mimo">仅小米 MiMo</option>
+              <option value="minimax">仅 MiniMax</option>
             </select>
           </div>
           <p class="muted">{{ ai.providerStatus }}</p>
@@ -432,8 +491,40 @@ onMounted(async () => { await skills.refresh() })
               {{ mimoTesting ? '测试中…' : '测试连接' }}</button>
             <button type="button" class="alt" :disabled="!ai.canRemoveMimo()" @click="removeMimoKey">清除</button>
           </div>
+          <div class="row">
+            <span class="muted">模型</span>
+            <input v-model="modelDrafts.mimo" type="text" list="mimoModelList"
+              placeholder="如 mimo-v2.6-pro" style="flex:1">
+            <datalist id="mimoModelList"><option v-for="m in modelOptions('mimo')" :key="m" :value="m" /></datalist>
+            <button type="button" @click="savePromptModel('mimo')">保存模型</button>
+          </div>
+          <p class="muted">{{ ai.models.mimo ? `当前模型：${ai.models.mimo.model}（${modelSourceLabel[ai.models.mimo.source] || ai.models.mimo.source}）` : '' }}</p>
           <p class="muted">{{ ai.mimoStatus }}</p>
           <p class="muted" aria-live="polite">{{ mimoTestStatus }}</p>
+        </details>
+
+        <!-- 备用提示词模型 · MiniMax -->
+        <details class="character-library">
+          <summary>备用提示词模型 · MiniMax</summary>
+          <p class="hint">当 DeepSeek 与小米 MiMo 都不可用时，Studio 会自动改用 MiniMax 完成提示词优化、AI 分镜和翻译。也可以在上方「提示词模型选择」里锁定只用 MiniMax。用量按 MiniMax 开放平台账户计费。</p>
+          <div class="row">
+            <input v-model="minimaxKey" type="password" autocomplete="new-password"
+              placeholder="粘贴 MiniMax API Key（保存后会清空输入框）">
+            <button type="button" @click="saveMinimaxKey">保存 Key</button>
+            <button type="button" class="alt" :disabled="minimaxTesting" @click="testMinimax">
+              {{ minimaxTesting ? '测试中…' : '测试连接' }}</button>
+            <button type="button" class="alt" :disabled="!ai.canRemoveMinimax()" @click="removeMinimaxKey">清除</button>
+          </div>
+          <div class="row">
+            <span class="muted">模型</span>
+            <input v-model="modelDrafts.minimax" type="text" list="minimaxModelList"
+              placeholder="如 MiniMax-M3" style="flex:1">
+            <datalist id="minimaxModelList"><option v-for="m in modelOptions('minimax')" :key="m" :value="m" /></datalist>
+            <button type="button" @click="savePromptModel('minimax')">保存模型</button>
+          </div>
+          <p class="muted">{{ ai.models.minimax ? `当前模型：${ai.models.minimax.model}（${modelSourceLabel[ai.models.minimax.source] || ai.models.minimax.source}）` : '' }}</p>
+          <p class="muted">{{ ai.minimaxStatus }}</p>
+          <p class="muted" aria-live="polite">{{ minimaxTestStatus }}</p>
         </details>
 
         <!-- 项目级提示词 Skill -->

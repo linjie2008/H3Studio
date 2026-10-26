@@ -4,7 +4,7 @@
 """
 from __future__ import annotations
 
-from prompt_tools import DEEPSEEK_MODEL
+from prompt_tools import deepseek_model
 from store import change
 from ai_config import deepseek_key
 from ai_config import deepseek_key_source
@@ -56,7 +56,7 @@ def deepseek_connection_status(force: bool = False) -> dict:
     try:
         with urllib.request.urlopen(request, timeout=8) as response:
             models = json.load(response)
-        available = any(item.get("id") == DEEPSEEK_MODEL for item in models.get("data", [])
+        available = any(item.get("id") == deepseek_model() for item in models.get("data", [])
                         if isinstance(item, dict))
         if available:
             balance_request = urllib.request.Request("https://api.deepseek.com/user/balance",
@@ -76,7 +76,7 @@ def deepseek_connection_status(force: bool = False) -> dict:
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
         state = "error"
         message = "连接超时或网络不可达" if isinstance(error, (TimeoutError, urllib.error.URLError)) else "状态响应无效"
-    result = {"state": state, "message": message, "model": DEEPSEEK_MODEL,
+    result = {"state": state, "message": message, "model": deepseek_model(),
               "key_source": source, "checked_at": time.time()}
     with _deepseek_status_lock:
         _deepseek_status_cache.update(checked_at=result["checked_at"], key=key_id, result=result)

@@ -110,7 +110,7 @@ async function checkHealth() {
 let healthTimer, deepseekTimer
 onMounted(async () => {
   await projectStore.load()
-  await Promise.all([ai.refreshDeepseek(), ai.refreshMimo(), ai.refreshProvider()])
+  await Promise.all([ai.refreshDeepseek(), ai.refreshMimo(), ai.refreshMinimax(), ai.refreshProvider()])
   checkHealth()
   refreshDeepseekHead()
   healthTimer = setInterval(checkHealth, 15000)

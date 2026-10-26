@@ -175,7 +175,7 @@
 
   // 2. Project Skill and machine-wide AI credentials have different scopes.
   const pAiServices = makePanel('ai_services');
-  const cardAiKeys = makeCard('AI 提示词模型与云端 API', '配置 DeepSeek 与小米 MiMo 密钥；用量按对应平台账户计费。', '🤖', 'settings-card-body-stack');
+  const cardAiKeys = makeCard('AI 提示词模型与云端 API', '配置 DeepSeek、小米 MiMo 与 MiniMax 密钥；用量按对应平台账户计费。', '🤖', 'settings-card-body-stack');
   const promptProviderEl = projectSettingsPage.querySelector('section.character-library:has(#promptProvider)');
   if (promptProviderEl) cardAiKeys.querySelector('.settings-card-body').append(promptProviderEl);
   const deepseekDetails = projectSettingsPage.querySelector('details.character-library:has(#deepseekKey)');
@@ -187,6 +187,11 @@
   if (mimoDetails) {
     mimoDetails.open = false;
     cardAiKeys.querySelector('.settings-card-body').append(mimoDetails);
+  }
+  const minimaxDetails = projectSettingsPage.querySelector('details.character-library:has(#minimaxKey)');
+  if (minimaxDetails) {
+    minimaxDetails.open = false;
+    cardAiKeys.querySelector('.settings-card-body').append(minimaxDetails);
   }
 
   pAiServices.append(cardAiKeys);

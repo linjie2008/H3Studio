@@ -10,7 +10,8 @@ import urllib.request
 import time
 from collections import Counter
 from pathlib import Path
-from ai_config import deepseek_key, mimo_key, prompt_provider
+from ai_config import deepseek_key, mimo_key, minimax_key, prompt_provider
+from ai_config import provider_model
 from engine import strip_shot_markers
 from prompt_skills import DEFAULT_SKILL, load_skill_context, preview_skill
 
@@ -19,6 +20,24 @@ DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = os.environ.get("H3_STUDIO_DEEPSEEK_MODEL", "deepseek-flash")
 MIMO_URL = os.environ.get("H3_STUDIO_MIMO_URL", "https://api.xiaomimimo.com/v1/chat/completions")
 MIMO_MODEL = os.environ.get("H3_STUDIO_MIMO_MODEL", "mimo-v2.6-pro")
+# MiniMax 开放平台的 OpenAI 兼容端点。国内站是 api.minimaxi.com，
+# 海外站是 api.minimax.io，可用 H3_STUDIO_MINIMAX_URL 覆盖。
+MINIMAX_URL = os.environ.get("H3_STUDIO_MINIMAX_URL", "https://api.minimaxi.com/v1/chat/completions")
+MINIMAX_MODEL = os.environ.get("H3_STUDIO_MINIMAX_MODEL", "MiniMax-M3")
+PROVIDER_LABELS = {"deepseek": "DeepSeek", "mimo": "小米 MiMo", "minimax": "MiniMax"}
+
+
+def deepseek_model() -> str:
+    """The model DeepSeek calls, honouring the user's own choice."""
+    return provider_model("deepseek") or DEEPSEEK_MODEL
+
+
+def mimo_model() -> str:
+    return provider_model("mimo") or MIMO_MODEL
+
+
+def minimax_model() -> str:
+    return provider_model("minimax") or MINIMAX_MODEL
 CREATIVE_MODES = {"t2v", "i2v", "fl2v"}
 _MEDIA_TAG = re.compile(r"<(Picture|Video|Audio)\s*(\d+)>|@图片\s*(\d+)", re.IGNORECASE)
 _completion_status_lock = threading.Lock()
@@ -39,9 +58,11 @@ def _selected_cloud_configured() -> bool:
     selected = prompt_provider()
     if selected == "mimo":
         return bool(mimo_key())
+    if selected == "minimax":
+        return bool(minimax_key())
     if selected == "deepseek":
         return bool(deepseek_key())
-    return bool(deepseek_key() or mimo_key())
+    return bool(deepseek_key() or mimo_key() or minimax_key())
 
 
 def _creative_prompt_without_reference_tags(text: str, context: dict, language: str) -> str:
@@ -67,29 +88,53 @@ def _model_reference_context(context: dict, mode: str) -> dict:
     return visible
 
 
+def _cloud_provider_chain() -> list[str]:
+    """Providers to try, in order, for the current model selection.
+
+    ``auto`` keeps DeepSeek first and falls back to the models that are
+    actually configured, so a missing key never blocks a working provider.
+    """
+    selected = prompt_provider()
+    if selected in PROVIDER_LABELS:
+        return [selected]
+    chain = ["deepseek"]
+    if mimo_key():
+        chain.append("mimo")
+    if minimax_key():
+        chain.append("minimax")
+    return chain
+
+
+def _complete_with_provider(provider: str, messages: list[dict], max_tokens: int | None,
+                            timeout: int, json_mode: bool, _json_retry: bool) -> str:
+    if provider == "mimo":
+        return _mimo_complete(messages, max_tokens, timeout, json_mode, _json_retry)
+    if provider == "minimax":
+        return _minimax_complete(messages, max_tokens, timeout, json_mode, _json_retry)
+    return _deepseek_complete_request(messages, max_tokens, timeout, json_mode, _json_retry)
+
+
 def _deepseek_complete(messages: list[dict], max_tokens: int | None, timeout: int,
                        json_mode: bool = False, _json_retry: bool = False) -> str:
-    selected_provider = prompt_provider()
-    if selected_provider == "mimo":
-        result = _mimo_complete(messages, max_tokens, timeout, json_mode, _json_retry)
+    chain = _cloud_provider_chain()
+    failures: list[str] = []
+    for index, provider in enumerate(chain):
+        try:
+            result = _complete_with_provider(provider, messages, max_tokens, timeout,
+                                             json_mode, _json_retry)
+        except Exception as error:
+            detail = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+            failures.append(detail)
+            _record_completion(False, detail)
+            if index < len(chain) - 1:
+                continue
+            if len(chain) == 1:
+                raise
+            names = "、".join(PROVIDER_LABELS.get(item, item) for item in chain)
+            raise RuntimeError(f"{names} 当前均不可用：" + "；".join(failures)) from None
         _record_completion(True)
         return result
-    try:
-        result = _deepseek_complete_request(messages, max_tokens, timeout, json_mode, _json_retry)
-    except Exception as error:
-        _record_completion(False, str(error) if isinstance(error, RuntimeError) else type(error).__name__)
-        # DeepSeek can expose a healthy account while its completion service is
-        # temporarily unavailable.  MiMo is deliberately a transparent fallback
-        # so existing optimize/storyboard calls need no provider selection.
-        if selected_provider != "auto" or not mimo_key():
-            raise
-        try:
-            result = _mimo_complete(messages, max_tokens, timeout, json_mode, _json_retry)
-        except Exception as fallback_error:
-            detail = str(fallback_error) if isinstance(fallback_error, RuntimeError) else type(fallback_error).__name__
-            raise RuntimeError(f"DeepSeek 当前不可用；小米 MiMo 备用模型也失败：{detail}") from None
-    _record_completion(True)
-    return result
+    raise RuntimeError("；".join(failures))
 
 
 def _mimo_complete(messages: list[dict], max_tokens: int | None, timeout: int,
@@ -98,7 +143,7 @@ def _mimo_complete(messages: list[dict], max_tokens: int | None, timeout: int,
     key = mimo_key()
     if not key:
         raise RuntimeError("请先在「项目设置 → 云端 AI」填写小米 MiMo API Key")
-    payload = {"model": MIMO_MODEL, "stream": False, "messages": messages}
+    payload = {"model": mimo_model(), "stream": False, "messages": messages}
     if max_tokens is not None:
         # MiMo's current API names this field max_completion_tokens.
         payload["max_completion_tokens"] = max_tokens
@@ -139,12 +184,86 @@ def _mimo_complete(messages: list[dict], max_tokens: int | None, timeout: int,
     return content.strip()
 
 
+def _strip_thinking(text: str) -> str:
+    """Remove the <think> block MiniMax reasoning models may prepend."""
+    cleaned = re.sub(r"<think>.*?</think>", "", str(text or ""), flags=re.DOTALL)
+    return cleaned.strip()
+
+
+def _minimax_complete(messages: list[dict], max_tokens: int | None, timeout: int,
+                       json_mode: bool = False, _json_retry: bool = False) -> str:
+    """Run an OpenAI-compatible MiniMax completion."""
+    key = minimax_key()
+    if not key:
+        raise RuntimeError("请先在「项目设置 → 云端 AI」填写 MiniMax API Key")
+    payload = {"model": minimax_model(), "stream": False, "messages": messages}
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    request = urllib.request.Request(
+        MINIMAX_URL, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
+    )
+    data = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.load(response)
+            break
+        except urllib.error.HTTPError as error:
+            if error.code in (500, 502, 503, 504) and attempt < 2:
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            message = {401: "MiniMax API Key 无效或已过期", 402: "MiniMax 账户余额不足",
+                       429: "MiniMax 请求过于频繁，请稍后再试"}.get(error.code)
+            raise RuntimeError(message or f"MiniMax API 请求失败（HTTP {error.code}）") from None
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            raise RuntimeError(f"无法连接 MiniMax 云端服务：{error}") from None
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError("MiniMax 返回格式无效，请稍后重试") from None
+    if not isinstance(content, str):
+        content = ""
+    content = _strip_thinking(content)
+    if not content.strip():
+        if json_mode and not _json_retry:
+            retry_messages = [dict(message) for message in messages]
+            retry_hint = ('\n\nReturn a non-empty valid JSON object now. Include every input shot id and its rewritten prompt.')
+            if retry_messages and retry_messages[-1].get("role") == "user":
+                retry_messages[-1]["content"] = str(retry_messages[-1].get("content") or "") + retry_hint
+            else:
+                retry_messages.append({"role": "user", "content": retry_hint})
+            return _minimax_complete(retry_messages, max_tokens, timeout, json_mode=True, _json_retry=True)
+        if json_mode:
+            raise RuntimeError("MiniMax JSON 模式连续返回空内容，原提示词未更改；请重试，或先在 AI 设置中测试连接")
+        raise RuntimeError("MiniMax 没有返回有效内容，请重试")
+    if json_mode and not _json_retry:
+        # MiniMax reasoning models sometimes wrap the answer in prose or
+        # thinking text.  Retry once asking for the bare JSON object so the
+        # strict decoder downstream still gets what it needs.
+        try:
+            json.loads(content)
+        except (ValueError, TypeError):
+            retry_messages = [dict(message) for message in messages]
+            retry_hint = ('\n\nYour previous reply was not valid JSON. Reply with the JSON object only — '
+                          'no prose, no markdown fence, no explanation. '
+                          'Example: {"prompts":[{"id":"input-id","prompt":"rewritten shot"}]}')
+            if retry_messages and retry_messages[-1].get("role") == "user":
+                retry_messages[-1]["content"] = str(retry_messages[-1].get("content") or "") + retry_hint
+            else:
+                retry_messages.append({"role": "user", "content": retry_hint})
+            return _minimax_complete(retry_messages, max_tokens, timeout, json_mode=True, _json_retry=True)
+    return content.strip()
+
+
 def _deepseek_complete_request(messages: list[dict], max_tokens: int | None, timeout: int,
                                json_mode: bool = False, _json_retry: bool = False) -> str:
     key = deepseek_key()
     if not key:
         raise RuntimeError("请先在「项目设置 → 云端 AI」填写 DeepSeek API Key")
-    payload = {"model": DEEPSEEK_MODEL, "stream": False, "messages": messages}
+    payload = {"model": deepseek_model(), "stream": False, "messages": messages}
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
     if json_mode:
@@ -203,7 +322,7 @@ def _deepseek_stream(messages: list[dict], max_tokens: int, timeout: int):
     key = deepseek_key()
     if not key:
         raise RuntimeError("请先在「项目设置 → 云端 AI」填写 DeepSeek API Key")
-    payload = {"model": DEEPSEEK_MODEL, "stream": True, "max_tokens": max_tokens,
+    payload = {"model": deepseek_model(), "stream": True, "max_tokens": max_tokens,
                "messages": messages}
     request = urllib.request.Request(
         DEEPSEEK_URL, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

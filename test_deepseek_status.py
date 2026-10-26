@@ -11,6 +11,15 @@ from server import support
 class DeepseekStatusTests(unittest.TestCase):
     """函数实现在 server.support；app 只做再导出，因此 patch 目标是 support。"""
 
+    def setUp(self):
+        # 云端状态徽章读的是模块级的“最近一次真实推理”记录；别的用例写过
+        # 它，这里必须复位，否则本模块的结果取决于用例执行顺序。
+        from prompt_tools import _completion_status
+        from prompt_tools import _completion_status_lock
+        with _completion_status_lock:
+            _completion_status.clear()
+            _completion_status.update({"ok": None, "checked_at": 0.0, "message": ""})
+
     def test_unconfigured_key_does_not_contact_provider(self):
         with patch.object(support, "deepseek_key", return_value=""), \
              patch.object(support.urllib.request, "urlopen") as urlopen:
